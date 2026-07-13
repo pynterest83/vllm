@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import math
 import time
-from unittest.mock import MagicMock, Mock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
@@ -34,7 +36,12 @@ from vllm.v1.engine.output_processor import (
     RequestOutputCollector,
     RequestState,
 )
-from vllm.v1.metrics.stats import IterationStats, PrefillStats, SchedulerStats
+from vllm.v1.metrics.stats import (
+    IterationStats,
+    PrefillStats,
+    RequestStateStats,
+    SchedulerStats,
+)
 
 
 @pytest.mark.parametrize("flat_logprobs", [False, True])
@@ -1133,6 +1140,35 @@ def test_iteration_stats(dummy_test_vectors):
 
     assert iteration_stats.num_prompt_tokens == 0
     assert iteration_stats.num_generation_tokens == num_active
+
+
+def test_alignment_request_timing_record_includes_engine_core_tpot():
+    request_state = SimpleNamespace(
+        external_req_id="cmpl-vibesim_7-0",
+        stats=RequestStateStats(
+            num_generation_tokens=10,
+            queued_ts=10.0,
+            scheduled_ts=10.003,
+            first_token_ts=10.0125,
+            last_token_ts=10.1925,
+        ),
+    )
+
+    with patch("vllm.v1.engine.output_processor.logger.info") as log_info:
+        OutputProcessor._log_alignment_request_timing(request_state)
+
+    log_info.assert_called_once()
+    message, encoded_record = log_info.call_args.args
+    assert message == "VibeSimAlignmentRequestTiming %s"
+    record = json.loads(encoded_record)
+    assert record["schema_version"] == 2
+    assert record["engine_request_id"] == "cmpl-vibesim_7-0"
+    assert record["engine_core_ttft_ms"] == pytest.approx(12.5)
+    assert record["engine_queue_wait_ms"] == pytest.approx(3.0)
+    assert record["engine_first_schedule_to_first_token_ms"] == pytest.approx(9.5)
+    assert record["engine_core_decode_ms"] == pytest.approx(180.0)
+    assert record["num_output_tokens"] == 10
+    assert record["engine_core_tpot_ms"] == pytest.approx(20.0)
 
 
 @pytest.mark.parametrize("log_stats", [True, False])

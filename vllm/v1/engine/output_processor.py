@@ -882,43 +882,6 @@ class OutputProcessor:
             self.lora_states,
             req_state.lora_name,
         )
-        if (
-            envs.VLLM_NVTX_SCOPES_FOR_PROFILING
-            and req_state.is_prefilling
-            and engine_core_output.new_token_ids
-        ):
-            queued_ts = req_state.stats.queued_ts
-            scheduled_ts = req_state.stats.scheduled_ts
-            if queued_ts <= 0.0 or scheduled_ts <= 0.0:
-                logger.warning(
-                    "VibeSim alignment request timing unavailable for %s: "
-                    "queued_ts=%s scheduled_ts=%s",
-                    req_state.external_req_id,
-                    queued_ts,
-                    scheduled_ts,
-                )
-            else:
-                # Both boundaries use EngineCore's monotonic clock. QUEUED is
-                # recorded when Scheduler.add_request appends to waiting; the
-                # EngineCoreOutputs timestamp is created after the first-token
-                # model iteration has returned and its output has been processed.
-                timing_record = {
-                    "schema_version": 1,
-                    # OpenAI completions wraps the caller's X-Request-Id as
-                    # `cmpl-<source-id>-0`; the profile extractor owns removing
-                    # that wire-protocol envelope and retains this raw id for audit.
-                    "engine_request_id": req_state.external_req_id,
-                    "engine_core_ttft_ms": (engine_core_timestamp - queued_ts) * 1000.0,
-                    "engine_queue_wait_ms": (scheduled_ts - queued_ts) * 1000.0,
-                    "engine_first_schedule_to_first_token_ms": (
-                        engine_core_timestamp - scheduled_ts
-                    )
-                    * 1000.0,
-                }
-                logger.info(
-                    "VibeSimAlignmentRequestTiming %s",
-                    json.dumps(timing_record, separators=(",", ":")),
-                )
 
     def _update_stats_from_finished(
         self,
@@ -939,8 +902,71 @@ class OutputProcessor:
             req_stats=req_state.stats,
             num_cached_tokens=req_state.num_cached_tokens,
         )
+        if envs.VLLM_NVTX_SCOPES_FOR_PROFILING:
+            self._log_alignment_request_timing(req_state)
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
 
         ParentRequest.observe_finished_request(
             req_state.parent_req, iteration_stats, req_state.stats.num_generation_tokens
+        )
+
+    @staticmethod
+    def _log_alignment_request_timing(req_state: RequestState) -> None:
+        """Emit one complete EngineCore timing record for an alignment request."""
+        assert req_state.stats is not None
+        request_stats = req_state.stats
+        timestamps = (
+            request_stats.queued_ts,
+            request_stats.scheduled_ts,
+            request_stats.first_token_ts,
+            request_stats.last_token_ts,
+        )
+        num_output_tokens = request_stats.num_generation_tokens
+        if any(timestamp <= 0.0 for timestamp in timestamps) or num_output_tokens <= 0:
+            logger.warning(
+                "VibeSim alignment request timing unavailable for %s: "
+                "queued_ts=%s scheduled_ts=%s first_token_ts=%s "
+                "last_token_ts=%s num_output_tokens=%s",
+                req_state.external_req_id,
+                *timestamps,
+                num_output_tokens,
+            )
+            return
+
+        queued_ts, scheduled_ts, first_token_ts, last_token_ts = timestamps
+        if not queued_ts <= scheduled_ts <= first_token_ts <= last_token_ts:
+            logger.warning(
+                "VibeSim alignment request timing timestamps are out of order for %s: "
+                "queued_ts=%s scheduled_ts=%s first_token_ts=%s last_token_ts=%s",
+                req_state.external_req_id,
+                *timestamps,
+            )
+            return
+
+        # Every boundary below is on EngineCore's monotonic clock. QUEUED is
+        # recorded when Scheduler.add_request appends to waiting. The first/last
+        # token timestamps are the EngineCoreOutputs timestamps created after
+        # the iterations producing those tokens have returned and been processed.
+        decode_ms = (last_token_ts - first_token_ts) * 1000.0
+        timing_record = {
+            "schema_version": 2,
+            # OpenAI completions wraps the caller's X-Request-Id as
+            # `cmpl-<source-id>-0`; the profile extractor owns removing that
+            # wire-protocol envelope and retains this raw id for audit.
+            "engine_request_id": req_state.external_req_id,
+            "engine_core_ttft_ms": (first_token_ts - queued_ts) * 1000.0,
+            "engine_queue_wait_ms": (scheduled_ts - queued_ts) * 1000.0,
+            "engine_first_schedule_to_first_token_ms": (first_token_ts - scheduled_ts)
+            * 1000.0,
+            "engine_core_decode_ms": decode_ms,
+            "num_output_tokens": num_output_tokens,
+            # One-token requests have no inter-token interval and therefore no
+            # TPOT sample; JSON null preserves that distinction from zero time.
+            "engine_core_tpot_ms": (
+                decode_ms / (num_output_tokens - 1) if num_output_tokens > 1 else None
+            ),
+        }
+        logger.info(
+            "VibeSimAlignmentRequestTiming %s",
+            json.dumps(timing_record, separators=(",", ":")),
         )
