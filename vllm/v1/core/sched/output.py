@@ -279,6 +279,11 @@ class SchedulerOutput:
     # need to perform grammar bitmask computation.
     pending_structured_output_tokens: bool = False
 
+    # EngineCore assigns this before dispatch. Workers use the same stable
+    # index in their per-phase NVTX ranges, while the EngineCore emits the
+    # matching structured model-input record after the iteration completes.
+    alignment_iteration_index: int | None = None
+
     # Used for adjusting acceptance rate calculation.
     num_invalid_spec_tokens: dict[str, int] | None = None
 

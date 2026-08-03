@@ -25,6 +25,7 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import json
 import threading
 import time
 from collections.abc import Sequence
@@ -634,6 +635,32 @@ class EplbState:
                         balancedness,
                         self.expert_rearrangement_step_interval
                         - self.expert_rearrangement_step,
+                    )
+                    # Machine-readable alignment-only routing evidence.  EPLB
+                    # logging is default-off; when explicitly enabled for the
+                    # popularity pass, map synchronized physical loads back to
+                    # stable logical expert ids before the mapping can change.
+                    physical_to_logical = eplb_model_state.physical_to_logical_map
+                    logical_expert_load = torch.zeros(
+                        (
+                            expert_load_pass.shape[0],
+                            eplb_model_state.model.num_logical_experts,
+                        ),
+                        dtype=expert_load_pass.dtype,
+                        device=expert_load_pass.device,
+                    )
+                    logical_expert_load.scatter_add_(
+                        1, physical_to_logical.long(), expert_load_pass
+                    )
+                    alignment_record = {
+                        "schema_version": 1,
+                        "model": eplb_model_state.model_name,
+                        "eplb_step": self.expert_rearrangement_step,
+                        "logical_expert_counts": logical_expert_load.tolist(),
+                    }
+                    logger.info(
+                        "VibeSimAlignmentExpertLoad %s",
+                        json.dumps(alignment_record, separators=(",", ":")),
                     )
 
         # Update the expert load sliding window
