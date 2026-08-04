@@ -572,8 +572,18 @@ class EngineCore:
             assert scheduler_output.alignment_iteration_index is not None
             iteration_index = scheduler_output.alignment_iteration_index
             is_dummy = False
-        before = time.monotonic()
+        # This timestamp is deliberately outside the CUDA/NSYS contract.  It
+        # gives alignment a low-overhead, full-run EngineCore cadence even when
+        # CUPTI is enabled only for a bounded window.  Adjacent starts include
+        # the bookkeeping/scheduling gap between model observations; the
+        # start-to-end duration retains the historical "iteration elapsed"
+        # observation around result wait + sampling.
+        observed_start_monotonic_ns = time.monotonic_ns()
         yield
+        observed_end_monotonic_ns = time.monotonic_ns()
+        observed_elapsed_ms = (
+            observed_end_monotonic_ns - observed_start_monotonic_ns
+        ) / 1e6
         logger.info(
             "".join(
                 [
@@ -588,7 +598,7 @@ class EngineCore:
                     " generation requests, ",
                     str(iteration_details.num_generation_tokens),
                     " generation tokens, iteration elapsed time: ",
-                    format((time.monotonic() - before) * 1000, ".2f"),
+                    format(observed_elapsed_ms, ".2f"),
                     " ms",
                     " (dummy)" if is_dummy else "",
                 ]
@@ -624,9 +634,12 @@ class EngineCore:
                 and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
             ]
             alignment_record = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "input_adapter": "vllm_text",
                 "iteration_index": iteration_index,
+                "observed_start_monotonic_ns": observed_start_monotonic_ns,
+                "observed_end_monotonic_ns": observed_end_monotonic_ns,
+                "observed_elapsed_ms": observed_elapsed_ms,
                 "prefill_tokens": iteration_details.num_ctx_tokens,
                 "decode_requests": iteration_details.num_generation_requests,
                 "decode_tokens_scheduled": iteration_details.num_generation_tokens,
