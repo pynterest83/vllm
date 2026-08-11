@@ -3,6 +3,8 @@
 
 
 import asyncio
+import io
+import json
 import time
 from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
@@ -32,7 +34,11 @@ from vllm.entrypoints.serve.engine.protocol import (
     PromptTokenUsageInfo,
     UsageInfo,
 )
-from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
+from vllm.entrypoints.serve.utils.api_utils import (
+    build_alignment_api_timing_record,
+    get_max_tokens,
+    should_include_usage,
+)
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import GenerationError
 from vllm.inputs import EngineInput, TokensPrompt, mm_input
@@ -111,6 +117,7 @@ class ServingTokens(GenerateBaseServing):
         request: GenerateRequest,
         raw_request: Request | None = None,
     ) -> GenerateResponse | ErrorResponse | AsyncGenerator[str, None]:
+        api_request_start_monotonic = time.monotonic()
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -286,6 +293,7 @@ class ServingTokens(GenerateBaseServing):
         )
 
         assert result_generator is not None
+        api_generators_ready_monotonic = time.monotonic()
 
         if request.stream:
             return self.serve_tokens_stream_generator(
@@ -294,6 +302,8 @@ class ServingTokens(GenerateBaseServing):
                 request_id,
                 model_name,
                 request_metadata,
+                api_request_start_monotonic,
+                api_generators_ready_monotonic,
             )
 
         return await self.serve_tokens_full_generator(
@@ -436,6 +446,8 @@ class ServingTokens(GenerateBaseServing):
         request_id: str,
         model_name: str,
         request_metadata: RequestResponseMetadata,
+        api_request_start_monotonic: float,
+        api_generators_ready_monotonic: float,
     ) -> AsyncGenerator[str, None]:
         num_prompt_tokens = 0
         num_generated_tokens: list[int] = []
@@ -444,6 +456,13 @@ class ServingTokens(GenerateBaseServing):
         num_cached_tokens = None
         sampling_params: SamplingParams = request.sampling_params
         last_res: RequestOutput | None = None
+        api_first_output_received_monotonic = None
+        api_last_output_received_monotonic = None
+        api_first_token_yield_monotonic = None
+        api_last_token_yield_monotonic = None
+        api_token_events = 0
+        api_first_token_event_tokens = 0
+        final_request_stats = None
 
         include_usage, include_continuous_usage = should_include_usage(
             request.stream_options, False
@@ -452,6 +471,9 @@ class ServingTokens(GenerateBaseServing):
         try:
             async for res in result_generator:
                 last_res = res
+                output_received_monotonic = time.monotonic()
+                if res.metrics is not None:
+                    final_request_stats = res.metrics
                 if first_iteration:
                     if res.prompt_token_ids is not None:
                         num_prompt_tokens = len(res.prompt_token_ids)
@@ -524,7 +546,17 @@ class ServingTokens(GenerateBaseServing):
                         for name in ("prompt_token_ids", "mm_placeholders", "metrics")
                         if getattr(chunk, name) is None
                     }
-                    yield f"data: {chunk.model_dump_json(exclude=exclude)}\n\n"
+                    response_json = chunk.model_dump_json(exclude=exclude)
+                    if api_first_output_received_monotonic is None:
+                        api_first_output_received_monotonic = output_received_monotonic
+                    api_last_output_received_monotonic = output_received_monotonic
+                    token_yield_monotonic = time.monotonic()
+                    if api_first_token_yield_monotonic is None:
+                        api_first_token_yield_monotonic = token_yield_monotonic
+                        api_first_token_event_tokens = len(delta_token_ids)
+                    api_last_token_yield_monotonic = token_yield_monotonic
+                    api_token_events += 1
+                    yield f"data: {response_json}\n\n"
 
             total_completion_tokens = sum(num_generated_tokens)
             final_usage_info = UsageInfo(
@@ -564,6 +596,55 @@ class ServingTokens(GenerateBaseServing):
             logger.exception("Error in token generation stream.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        api_done_yield_monotonic = time.monotonic()
+        if (
+            final_request_stats is not None
+            and api_first_output_received_monotonic is not None
+            and api_last_output_received_monotonic is not None
+            and api_first_token_yield_monotonic is not None
+            and api_last_token_yield_monotonic is not None
+            and final_request_stats.queued_ts > 0.0
+            and final_request_stats.first_token_ts > 0.0
+            and final_request_stats.last_token_ts > 0.0
+            and final_request_stats.api_generate_start_ts > 0.0
+            and final_request_stats.api_add_request_done_ts > 0.0
+            and final_request_stats.api_first_engine_output_received_ts > 0.0
+            and final_request_stats.api_first_output_collector_put_ts > 0.0
+            and final_request_stats.api_first_output_dequeued_ts > 0.0
+        ):
+            timing_record = build_alignment_api_timing_record(
+                request_id=request_id,
+                request_start_monotonic=api_request_start_monotonic,
+                generators_ready_monotonic=api_generators_ready_monotonic,
+                first_output_received_monotonic=api_first_output_received_monotonic,
+                last_output_received_monotonic=api_last_output_received_monotonic,
+                first_token_yield_monotonic=api_first_token_yield_monotonic,
+                last_token_yield_monotonic=api_last_token_yield_monotonic,
+                done_yield_monotonic=api_done_yield_monotonic,
+                engine_queued_monotonic=final_request_stats.queued_ts,
+                engine_first_token_monotonic=final_request_stats.first_token_ts,
+                engine_last_token_monotonic=final_request_stats.last_token_ts,
+                generate_start_monotonic=final_request_stats.api_generate_start_ts,
+                add_request_done_monotonic=(
+                    final_request_stats.api_add_request_done_ts
+                ),
+                first_engine_output_received_monotonic=(
+                    final_request_stats.api_first_engine_output_received_ts
+                ),
+                first_output_collector_put_monotonic=(
+                    final_request_stats.api_first_output_collector_put_ts
+                ),
+                first_output_dequeued_monotonic=(
+                    final_request_stats.api_first_output_dequeued_ts
+                ),
+                output_tokens=sum(num_generated_tokens),
+                token_events=api_token_events,
+                first_token_event_tokens=api_first_token_event_tokens,
+            )
+            logger.info(
+                "VibeSimAlignmentApiRequestTiming %s",
+                json.dumps(timing_record, separators=(",", ":")),
+            )
         yield "data: [DONE]\n\n"
 
     def _create_tokens_logprobs(

@@ -232,6 +232,15 @@ class RequestStateStats:
     first_token_ts: float = 0.0
     last_token_ts: float = 0.0
 
+    # These timestamps are produced and consumed entirely in the API process.
+    # They decompose lazy generator activation and first-output delivery around
+    # the separate EngineCore duration without crossing absolute clock domains.
+    api_generate_start_ts: float = 0.0
+    api_add_request_done_ts: float = 0.0
+    api_first_engine_output_received_ts: float = 0.0
+    api_first_output_collector_put_ts: float = 0.0
+    api_first_output_dequeued_ts: float = 0.0
+
     # first token latency
     first_token_latency: float = 0.0
 

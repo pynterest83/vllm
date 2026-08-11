@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -70,6 +71,13 @@ class RequestOutputCollector:
 
     def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:
         """Non-blocking put operation."""
+        if (
+            isinstance(output, RequestOutput)
+            and output.metrics is not None
+            and output.metrics.api_first_output_collector_put_ts == 0.0
+            and any(completion.token_ids for completion in output.outputs)
+        ):
+            output.metrics.api_first_output_collector_put_ts = time.monotonic()
         if self.output is None or isinstance(output, Exception):
             self.output = output
             self.ready.set()
@@ -652,6 +660,7 @@ class OutputProcessor:
         engine_core_outputs: list[EngineCoreOutput],
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
+        api_engine_output_received_timestamp: float | None = None,
     ) -> OutputProcessorOutput:
         """Process the EngineCoreOutputs:
         1) Compute stats for logging
@@ -681,6 +690,18 @@ class OutputProcessor:
             if req_state is None:
                 # Ignore output for already-aborted request.
                 continue
+
+            if (
+                api_engine_output_received_timestamp is not None
+                and req_state.stats is not None
+                and req_state.stats.api_first_engine_output_received_ts == 0.0
+                and engine_core_output.new_token_ids
+            ):
+                # Reuse the existing per-output loop so instrumentation does not
+                # add another full-batch pass to this latency-sensitive path.
+                req_state.stats.api_first_engine_output_received_ts = (
+                    api_engine_output_received_timestamp
+                )
 
             # 1) Compute stats for this iteration.
             self._update_stats_from_output(

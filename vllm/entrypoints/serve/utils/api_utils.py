@@ -33,6 +33,98 @@ VLLM_SUBCMD_PARSER_EPILOG = (
 )
 
 
+def build_alignment_api_timing_record(
+    *,
+    request_id: str,
+    request_start_monotonic: float,
+    generators_ready_monotonic: float,
+    first_output_received_monotonic: float,
+    last_output_received_monotonic: float,
+    first_token_yield_monotonic: float,
+    last_token_yield_monotonic: float,
+    done_yield_monotonic: float,
+    engine_queued_monotonic: float,
+    engine_first_token_monotonic: float,
+    engine_last_token_monotonic: float,
+    generate_start_monotonic: float,
+    add_request_done_monotonic: float,
+    first_engine_output_received_monotonic: float,
+    first_output_collector_put_monotonic: float,
+    first_output_dequeued_monotonic: float,
+    output_tokens: int,
+    token_events: int,
+    first_token_event_tokens: int,
+) -> dict[str, int | float | str]:
+    """Build one same-request API timing record without crossing clocks.
+
+    EngineCore and API timestamps come from different processes. The report
+    compares durations within each clock domain; it never subtracts an API
+    absolute timestamp from an EngineCore absolute timestamp.
+    """
+    return {
+        "schema_version": 3,
+        "api_request_id": request_id,
+        "output_tokens": output_tokens,
+        "token_events": token_events,
+        "first_token_event_tokens": first_token_event_tokens,
+        "api_frontend_prepare_ms": (
+            generators_ready_monotonic - request_start_monotonic
+        )
+        * 1000.0,
+        "api_first_output_wait_ms": (
+            first_output_received_monotonic - generators_ready_monotonic
+        )
+        * 1000.0,
+        "api_stream_activation_ms": (
+            generate_start_monotonic - generators_ready_monotonic
+        )
+        * 1000.0,
+        "api_add_request_ms": (add_request_done_monotonic - generate_start_monotonic)
+        * 1000.0,
+        "api_collector_wait_ms": (
+            first_output_collector_put_monotonic - add_request_done_monotonic
+        )
+        * 1000.0,
+        "api_engine_output_wait_ms": (
+            first_engine_output_received_monotonic - add_request_done_monotonic
+        )
+        * 1000.0,
+        "api_output_fanout_ms": (
+            first_output_collector_put_monotonic
+            - first_engine_output_received_monotonic
+        )
+        * 1000.0,
+        "api_collector_wakeup_ms": (
+            first_output_dequeued_monotonic - first_output_collector_put_monotonic
+        )
+        * 1000.0,
+        "api_generator_resume_ms": (
+            first_output_received_monotonic - first_output_dequeued_monotonic
+        )
+        * 1000.0,
+        "api_first_output_serialize_ms": (
+            first_token_yield_monotonic - first_output_received_monotonic
+        )
+        * 1000.0,
+        "api_token_output_receive_span_ms": (
+            last_output_received_monotonic - first_output_received_monotonic
+        )
+        * 1000.0,
+        "api_token_sse_yield_span_ms": (
+            last_token_yield_monotonic - first_token_yield_monotonic
+        )
+        * 1000.0,
+        "api_terminal_tail_ms": (done_yield_monotonic - last_token_yield_monotonic)
+        * 1000.0,
+        "engine_core_ttft_ms": (engine_first_token_monotonic - engine_queued_monotonic)
+        * 1000.0,
+        "engine_core_decode_ms": (
+            engine_last_token_monotonic - engine_first_token_monotonic
+        )
+        * 1000.0,
+    }
+
+
 async def listen_for_disconnect(request: Request) -> None:
     """Returns if a disconnect message is received."""
     while True:

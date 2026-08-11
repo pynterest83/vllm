@@ -3,12 +3,15 @@
 
 import json
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from vllm.config.multimodal import MultiModalConfig
+from vllm.entrypoints.serve.engine.protocol import RequestResponseMetadata
+from vllm.entrypoints.scale_out.token_in_token_out import serving as serving_module
 from vllm.entrypoints.generate.base.protocol import StreamOptions
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
@@ -28,7 +31,7 @@ from vllm.renderers import renderer_from_config
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
-from vllm.v1.metrics.stats import RequestSpecDecodeMetrics
+from vllm.v1.metrics.stats import RequestSpecDecodeMetrics, RequestStateStats
 
 MODEL_NAME = "openai-community/gpt2"
 BASE_MODEL_PATHS = [
@@ -133,6 +136,7 @@ def _make_request_output(
     num_cached_tokens: int | None = None,
     index: int = 0,
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None,
+    metrics: RequestStateStats | None = None,
 ) -> RequestOutput:
     return RequestOutput(
         request_id=request_id,
@@ -151,7 +155,7 @@ def _make_request_output(
             )
         ],
         finished=finished,
-        metrics=None,
+        metrics=metrics,
         lora_request=None,
         encoder_prompt=None,
         encoder_prompt_token_ids=None,
@@ -792,6 +796,86 @@ async def test_stream_zero_token_completion_emits_no_chunk_by_default():
 
     assert not [c for c in parsed if isinstance(c, dict) and c.get("choices")]
     assert parsed[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_stream_logs_alignment_api_timing(monkeypatch: pytest.MonkeyPatch):
+    request_metrics = RequestStateStats(
+        queued_ts=10.0,
+        first_token_ts=10.015,
+        last_token_ts=10.215,
+        api_generate_start_ts=100.005,
+        api_add_request_done_ts=100.007,
+        api_first_engine_output_received_ts=100.016,
+        api_first_output_collector_put_ts=100.018,
+        api_first_output_dequeued_ts=100.019,
+    )
+
+    async def mock_generate(*args, **kwargs):
+        yield _make_request_output("req-1", token_ids=[10], metrics=request_metrics)
+        yield _make_request_output("req-1", token_ids=[20, 30], metrics=request_metrics)
+        yield _make_request_output(
+            "req-1",
+            token_ids=[40],
+            finish_reason="stop",
+            finished=True,
+            metrics=request_metrics,
+        )
+
+    serving = object.__new__(ServingTokens)
+    serving.enable_prompt_tokens_details = False
+    logger_info = MagicMock()
+    monkeypatch.setattr(serving_module.logger, "info", logger_info)
+    monotonic_values = iter(
+        [100.020, 100.021, 100.120, 100.121, 100.220, 100.221, 100.222]
+    )
+    monkeypatch.setattr(
+        serving_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+
+    request = GenerateRequest(
+        token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=10),
+        model=MODEL_NAME,
+        stream=True,
+    )
+
+    response = serving.serve_tokens_stream_generator(
+        request,
+        mock_generate(),
+        "generate-tokens-vibesim_1",
+        MODEL_NAME,
+        RequestResponseMetadata(request_id="generate-tokens-vibesim_1"),
+        100.0,
+        100.003,
+    )
+    chunks = [chunk async for chunk in response]
+
+    assert chunks[-1] == "data: [DONE]\n\n"
+    timing_calls = [
+        call
+        for call in logger_info.call_args_list
+        if call.args[0] == "VibeSimAlignmentApiRequestTiming %s"
+    ]
+    assert len(timing_calls) == 1
+    timing_record = json.loads(timing_calls[0].args[1])
+    assert timing_record["schema_version"] == 3
+    assert timing_record["api_request_id"].startswith("generate-tokens-")
+    assert timing_record["output_tokens"] == 4
+    assert timing_record["token_events"] == 3
+    assert timing_record["first_token_event_tokens"] == 1
+    assert timing_record["engine_core_ttft_ms"] == pytest.approx(15.0)
+    assert timing_record["engine_core_decode_ms"] == pytest.approx(200.0)
+    assert timing_record["api_first_output_wait_ms"] == pytest.approx(17.0)
+    assert timing_record["api_stream_activation_ms"] == pytest.approx(2.0)
+    assert timing_record["api_add_request_ms"] == pytest.approx(2.0)
+    assert timing_record["api_collector_wait_ms"] == pytest.approx(11.0)
+    assert timing_record["api_engine_output_wait_ms"] == pytest.approx(9.0)
+    assert timing_record["api_output_fanout_ms"] == pytest.approx(2.0)
+    assert timing_record["api_collector_wakeup_ms"] == pytest.approx(1.0)
+    assert timing_record["api_generator_resume_ms"] == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio
