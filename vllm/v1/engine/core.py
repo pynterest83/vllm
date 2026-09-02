@@ -555,12 +555,13 @@ class EngineCore:
 
     @contextmanager
     def log_iteration_details(self, scheduler_output: SchedulerOutput | None):
+        observation: dict[str, ModelRunnerOutput] = {}
         if not self.vllm_config.observability_config.enable_logging_iteration_details:
-            yield
+            yield observation
             return
         # 0-token step: let the dummy_batch wrapper log it (avoids double-log).
         if scheduler_output and scheduler_output.total_num_scheduled_tokens == 0:
-            yield
+            yield observation
             return
         # scheduler_output=None marks a DP dummy iteration.
         if scheduler_output is None:
@@ -579,7 +580,7 @@ class EngineCore:
         # start-to-end duration retains the historical "iteration elapsed"
         # observation around result wait + sampling.
         observed_start_monotonic_ns = time.monotonic_ns()
-        yield
+        yield observation
         observed_end_monotonic_ns = time.monotonic_ns()
         observed_elapsed_ms = (
             observed_end_monotonic_ns - observed_start_monotonic_ns
@@ -633,8 +634,52 @@ class EngineCore:
                 if not cached_requests.is_context_phase(request_id)
                 and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
             ]
+            decode_query_lens = [
+                scheduler_output.num_scheduled_tokens[request_id]
+                for request_id in cached_requests.req_ids
+                if not cached_requests.is_context_phase(request_id)
+                and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
+            ]
+            model_output = observation.get("model_output")
+            decode_request_progress = []
+            if model_output is not None:
+                for request_index, request_id in enumerate(cached_requests.req_ids):
+                    query_len = scheduler_output.num_scheduled_tokens.get(request_id, 0)
+                    if cached_requests.is_context_phase(request_id) or query_len <= 0:
+                        continue
+                    output_index = model_output.req_id_to_index[request_id]
+                    emitted_tokens = len(model_output.sampled_token_ids[output_index])
+                    drafted_tokens = len(
+                        scheduler_output.scheduled_spec_decode_tokens.get(
+                            request_id, ()
+                        )
+                    )
+                    accepted_draft_tokens = (
+                        max(emitted_tokens - 1, 0) if drafted_tokens else 0
+                    )
+                    if accepted_draft_tokens > drafted_tokens:
+                        raise ValueError(
+                            "alignment speculative acceptance exceeds drafted tokens: "
+                            f"request={request_id!r} accepted={accepted_draft_tokens} "
+                            f"drafted={drafted_tokens}"
+                        )
+                    decode_request_progress.append(
+                        {
+                            "engine_request_id": request_id,
+                            "kv_len": cached_requests.num_computed_tokens[
+                                request_index
+                            ],
+                            "query_len": query_len,
+                            "output_tokens_before": (
+                                cached_requests.num_output_tokens[request_index]
+                            ),
+                            "drafted_tokens": drafted_tokens,
+                            "accepted_draft_tokens": accepted_draft_tokens,
+                            "emitted_tokens": emitted_tokens,
+                        }
+                    )
             alignment_record = {
-                "schema_version": 2,
+                "schema_version": 4,
                 "input_adapter": "vllm_text",
                 "iteration_index": iteration_index,
                 "observed_start_monotonic_ns": observed_start_monotonic_ns,
@@ -642,9 +687,11 @@ class EngineCore:
                 "observed_elapsed_ms": observed_elapsed_ms,
                 "prefill_tokens": iteration_details.num_ctx_tokens,
                 "decode_requests": iteration_details.num_generation_requests,
-                "decode_tokens_scheduled": iteration_details.num_generation_tokens,
+                "decode_tokens_scheduled": (iteration_details.num_generation_tokens),
                 "prefill_chunk_pairs": prefill_chunk_pairs,
                 "decode_kv_lens": decode_kv_lens,
+                "decode_query_lens": decode_query_lens,
+                "decode_request_progress": decode_request_progress,
             }
             logger.info(
                 "VibeSimAlignmentIteration %s",
@@ -750,12 +797,13 @@ class EngineCore:
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
-            self.log_iteration_details(scheduler_output),
             self.log_error_detail(scheduler_output),
+            self.log_iteration_details(scheduler_output) as alignment_observation,
         ):
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+            alignment_observation["model_output"] = model_output
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -850,8 +898,8 @@ class EngineCore:
         future, scheduler_output, exec_model_fut = batch_queue.pop()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
-            self.log_iteration_details(scheduler_output),
             self.log_error_detail(scheduler_output),
+            self.log_iteration_details(scheduler_output) as alignment_observation,
         ):
             model_output = future.result()
             if model_output is None:
@@ -859,6 +907,7 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+            alignment_observation["model_output"] = model_output
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.

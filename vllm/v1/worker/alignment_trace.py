@@ -35,6 +35,7 @@ ROUTING_TRACE_PATH_ENV = "VLLM_VIBESIM_ROUTING_TRACE_PATH"
 ROUTING_TRACE_ITERS_ENV = "VLLM_VIBESIM_ROUTING_TRACE_ITERS"
 ROUTING_TRACE_BLOCK_M_ENV = "VLLM_VIBESIM_ROUTING_TRACE_BLOCK_M"
 ROUTING_TRACE_GLOBAL_COUNTS_ENV = "VLLM_VIBESIM_ROUTING_TRACE_GLOBAL_COUNTS"
+ROUTING_TRACE_TOPK_IDS_ENV = "VLLM_VIBESIM_ROUTING_TRACE_TOPK_IDS"
 
 
 def is_token_trace_enabled() -> bool:
@@ -281,6 +282,7 @@ def dump_routing_summary(
     num_tokens = min(int(num_tokens), int(device_buffer.shape[0]))
     block_m = int(os.environ.get(ROUTING_TRACE_BLOCK_M_ENV, "64"))
     include_global_counts = os.environ.get(ROUTING_TRACE_GLOBAL_COUNTS_ENV, "1") != "0"
+    include_topk_ids = os.environ.get(ROUTING_TRACE_TOPK_IDS_ENV, "0") == "1"
     provenance = _device_provenance()
 
     for layer_id, layer_name, layer in _iter_moe_layers(static_forward_context):
@@ -354,5 +356,14 @@ def dump_routing_summary(
         row.update(provenance)
         if include_global_counts:
             row["global_counts"] = global_counts
+        if include_topk_ids:
+            # This is deliberately opt-in: one selected decode iteration is
+            # small, while an unbounded prefill dump would be unnecessarily
+            # large. Keep the token-major layout so the companion token trace's
+            # per-request spans can recover within-request routing correlation.
+            row["global_topk_ids"] = [
+                [int(expert_id) for expert_id in token_experts]
+                for token_experts in topk_ids.detach().cpu().tolist()
+            ]
 
         _append_jsonl(trace_path, row)

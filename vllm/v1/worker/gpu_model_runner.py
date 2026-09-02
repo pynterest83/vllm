@@ -5360,6 +5360,8 @@ class GPUModelRunner(
                         self.eplb_state.add_model(
                             drafter_moe_model,
                             spec_config.draft_model_config,
+                            model_role="draft",
+                            max_forwards_per_step=spec_config.num_speculative_tokens,
                         )
                         assert hasattr(self.drafter, "set_eplb_state")
                         self.drafter.set_eplb_state(self.eplb_state)
@@ -5382,6 +5384,7 @@ class GPUModelRunner(
                     self.eplb_state.add_model(
                         self._moe_model,
                         self.model_config,
+                        model_role="target",
                     )
                     eplb_models += 1
 

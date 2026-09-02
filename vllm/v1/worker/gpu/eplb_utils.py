@@ -77,7 +77,12 @@ class EPLBController:
         assert speculative_config is not None
         assert speculative_config.draft_model_config is not None
         assert self.state is not None
-        self.state.add_model(draft_moe_model, speculative_config.draft_model_config)
+        self.state.add_model(
+            draft_moe_model,
+            speculative_config.draft_model_config,
+            model_role="draft",
+            max_forwards_per_step=speculative_config.num_speculative_tokens,
+        )
         speculator.set_eplb_state(self.state)
         self._has_registered_models = True
         return True
@@ -96,7 +101,7 @@ class EPLBController:
             "EPLB is enabled for MoE part of model %s.", model_config.model
         )
         assert self.state is not None
-        self.state.add_model(moe_model, model_config)
+        self.state.add_model(moe_model, model_config, model_role="target")
         self._has_registered_models = True
         return True
 

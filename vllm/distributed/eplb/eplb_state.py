@@ -187,6 +187,10 @@ class EplbModelState:
     last_expert_load: torch.Tensor
     """Global logical-expert totals from the last reshuffle; equal demand initially."""
     model_name: str
+    model_role: str
+    """Stable alignment role: ``target`` or ``draft``."""
+    max_forwards_per_step: int
+    """Maximum executions of this model per EngineCore step."""
     experts_per_token: int
     """Number of routed experts selected for each input token."""
     model: MixtureOfExperts
@@ -359,8 +363,15 @@ class EplbState:
         self,
         model: MixtureOfExperts,
         model_config: ModelConfig,
+        *,
+        model_role: str = "target",
+        max_forwards_per_step: int = 1,
     ):
         """Build the initial EPLB state."""
+        if model_role not in {"target", "draft"}:
+            raise ValueError(f"unsupported EPLB model role: {model_role!r}")
+        if max_forwards_per_step <= 0:
+            raise ValueError("max_forwards_per_step must be positive")
         self.validate_ep_configuration(model)
         self.is_async = self.parallel_config.eplb_config.use_async
 
@@ -515,6 +526,8 @@ class EplbState:
                 device=self.device,
             ),
             model_name=model_config.model,
+            model_role=model_role,
+            max_forwards_per_step=max_forwards_per_step,
             experts_per_token=experts_per_token,
             model=model,
             expert_buffer=expert_buffer,
@@ -661,8 +674,13 @@ class EplbState:
                         1, physical_to_logical.long(), expert_load_pass
                     )
                     alignment_record = {
-                        "schema_version": 2,
+                        "schema_version": 3,
                         "model": eplb_model_state.model_name,
+                        "model_role": eplb_model_state.model_role,
+                        "max_forwards_per_step": (
+                            eplb_model_state.max_forwards_per_step
+                        ),
+                        "observed_monotonic_ns": time.monotonic_ns(),
                         "eplb_step": self.expert_rearrangement_step,
                         "expert_parallel_size": ep_group.size(),
                         "experts_per_token": eplb_model_state.experts_per_token,
