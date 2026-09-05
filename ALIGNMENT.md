@@ -55,6 +55,17 @@ If the upstream base changes, update the wheel commit explicitly. Import and
 GPU validation must resolve Python and native extensions under this worktree.
 An import check alone does not qualify the driver or a serving run.
 
+New VibeSim profile configs should set `fork_python` to
+`/raid/kanzhu/VibeSimWorkspace/wt-vllm-glm53-dflash2/.venv/bin/python`.
+Keep the original checkout's profiler environment and presets unchanged.
+Run pre-commit checks explicitly in this worktree; do not replace shared Git
+hooks with a hook that points at this environment.
+
+The native wheel selected by the fixed commit's official `cu130` metadata is
+also saved in `../glm53-dflash2-artifacts/`. If that metadata endpoint is
+temporarily unavailable, set `VLLM_PRECOMPILED_WHEEL_LOCATION` to the path in
+`vllm-wheel-path.txt`. `native-wheel.json` records its SHA256 and provenance.
+
 ## Frozen models
 
 | Role | Repository | Revision |
