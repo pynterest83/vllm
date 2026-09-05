@@ -202,7 +202,6 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
-from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.alignment_trace import (
     dump_routing_summary as dump_alignment_routing_summary,
 )
@@ -213,6 +212,7 @@ from vllm.v1.worker.alignment_trace import (
     should_trace_routing_iteration,
     should_trace_token_iteration,
 )
+from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_dcp_dummy_context_len,

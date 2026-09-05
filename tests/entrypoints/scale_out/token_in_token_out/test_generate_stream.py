@@ -10,11 +10,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from vllm.config.multimodal import MultiModalConfig
-from vllm.entrypoints.serve.engine.protocol import RequestResponseMetadata
-from vllm.entrypoints.scale_out.token_in_token_out import serving as serving_module
-from vllm.entrypoints.generate.base.protocol import StreamOptions
+from vllm.entrypoints.generate.base.protocol import (
+    RequestResponseMetadata,
+    StreamOptions,
+)
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.scale_out.token_in_token_out import serving as serving_module
 from vllm.entrypoints.scale_out.token_in_token_out.mm_features import (
     placeholder_ranges_from_engine_input,
 )

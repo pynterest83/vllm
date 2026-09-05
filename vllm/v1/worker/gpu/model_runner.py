@@ -79,6 +79,13 @@ from vllm.v1.watermarking.spec_decode import (
     create_speculative_target_watermarker,
     speculative_target_watermark_key,
 )
+from vllm.v1.worker.alignment_trace import (
+    alignment_phase_scope,
+    dump_routing_summary,
+    dump_token_inputs,
+    should_trace_routing_iteration,
+    should_trace_token_iteration,
+)
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -1673,6 +1680,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    @alignment_phase_scope
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1684,6 +1692,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # Indexed NVTX phases for real dispatches only; warmup has no iteration.
+        iteration_index = (
+            None
+            if dummy_run or scheduler_output.total_num_scheduled_tokens == 0
+            else scheduler_output.alignment_iteration_index
+        )
+        self._alignment_iteration_index = iteration_index
+        phases = self._alignment_phase_scope
+        phases.switch(iteration_index, "preprocess")
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1949,6 +1966,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        if not dummy_run and should_trace_token_iteration(iteration_index):
+            dump_token_inputs(
+                iteration_index=iteration_index,
+                input_ids=input_batch.input_ids,
+                req_ids=input_batch.req_ids,
+                num_scheduled_tokens=(
+                    input_batch.query_start_loc[: input_batch.num_reqs + 1]
+                    .diff()
+                    .cpu()
+                ),
+                num_tokens=input_batch.num_tokens,
+                positions=input_batch.positions,
+            )
+
         connector_kwargs = dict(
             scheduler_output=scheduler_output,
             request_state_indices=input_batch.idx_mapping,
@@ -1956,6 +1987,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens=input_batch.num_tokens,
         )
 
+        phases.switch(iteration_index, "forward")
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2008,6 +2040,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.kv_connector.finish_forward()
 
+        phases.switch(iteration_index, "postprocess")
+        if not dummy_run and should_trace_routing_iteration(iteration_index):
+            # v0.31 owns the capturer inside the aux-output connector, so the
+            # routing dump needs --enable-return-routed-experts to have one.
+            connector = self.aux_output_connector
+            dump_routing_summary(
+                capturer=getattr(connector, "_capturer", None),
+                static_forward_context=self.compilation_config.static_forward_context,
+                iteration_index=iteration_index,
+                num_tokens=input_batch.num_tokens,
+            )
+
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
@@ -2034,6 +2078,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=cudagraph_stats,
+            alignment_iteration_index=iteration_index,
         )
 
         if not self.is_last_pp_rank:
@@ -2047,6 +2092,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     @step_eplb_after()
+    @alignment_phase_scope
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
@@ -2063,7 +2109,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
+        iteration_index = self.execute_model_state.alignment_iteration_index
         self.execute_model_state = None
+        phases = self._alignment_phase_scope
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: hidden_states is None because this rank produced
@@ -2086,6 +2134,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         # Last rank: sample tokens
+        phases.switch(iteration_index, "sample")
         assert hidden_states is not None
         draft_hidden_states = hidden_states
         if self.pcp_manager is not None:
@@ -2124,6 +2173,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         )
 
+        phases.switch(iteration_index, "bookkeep")
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(
             req_ids=input_batch.req_ids,
@@ -2182,6 +2232,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         if self.speculator is not None:
+            phases.switch(iteration_index, "draft")
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.observe_verification(
@@ -2222,6 +2273,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
 
+        phases.switch(iteration_index, "bookkeep")
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
@@ -2374,6 +2426,7 @@ class ExecuteModelState(NamedTuple):
     finished_req_ids: set[str]
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
+    alignment_iteration_index: int | None = None
 
 
 class BatchReqState(NamedTuple):

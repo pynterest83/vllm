@@ -3,7 +3,6 @@
 
 
 import asyncio
-import io
 import json
 import time
 from collections.abc import AsyncGenerator

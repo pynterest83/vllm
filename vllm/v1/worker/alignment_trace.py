@@ -20,10 +20,12 @@ dump row joins to a `vllm_iteration(N)` NVTX range and to that iteration's
 from __future__ import annotations
 
 import fcntl
+import functools
 import json
 import math
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -367,3 +369,55 @@ def dump_routing_summary(
             ]
 
         _append_jsonl(trace_path, row)
+
+
+def alignment_phase(iteration_index: int | None, phase: str):
+    """Use indexed scopes for real dispatches only; warmup has no iteration."""
+    if iteration_index is None:
+        return nullcontext()
+    from vllm.v1.utils import record_function_or_nullcontext
+
+    return record_function_or_nullcontext(f"vllm_iteration({iteration_index}): {phase}")
+
+
+class AlignmentPhaseScope:
+    """Sequential, non-nested phase ranges for one model-runner call.
+
+    Marks phase boundaries in place, so upstream runner code keeps its own
+    indentation and later rebases do not rewrap whole blocks. At most one
+    phase range is open at a time; ``switch`` closes the previous one.
+    """
+
+    __slots__ = ("_active",)
+
+    def __init__(self) -> None:
+        self._active = None
+
+    def switch(self, iteration_index: int | None, phase: str) -> None:
+        self.close()
+        if iteration_index is None:
+            return
+        scope = alignment_phase(iteration_index, phase)
+        scope.__enter__()
+        self._active = scope
+
+    def close(self) -> None:
+        scope, self._active = self._active, None
+        if scope is not None:
+            scope.__exit__(None, None, None)
+
+
+def alignment_phase_scope(fn):
+    """Give a runner method a phase scope that closes on every exit path."""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        scope = self.__dict__.get("_alignment_phase_scope")
+        if scope is None:
+            scope = self._alignment_phase_scope = AlignmentPhaseScope()
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            scope.close()
+
+    return wrapper

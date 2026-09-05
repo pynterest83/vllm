@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
-import io
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator

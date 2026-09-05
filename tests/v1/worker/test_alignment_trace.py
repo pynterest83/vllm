@@ -12,11 +12,37 @@ from vllm.v1.worker.alignment_trace import (
     ROUTING_TRACE_PATH_ENV,
     TOKEN_TRACE_ITERS_ENV,
     TOKEN_TRACE_PATH_ENV,
+    alignment_phase,
     build_token_input_row,
     grouped_gemm_block_stats,
     parse_iterations,
     should_trace_token_iteration,
 )
+
+
+def test_alignment_phase_skips_warmup_and_closes_on_failure(monkeypatch):
+    from contextlib import contextmanager
+
+    events = []
+
+    @contextmanager
+    def scope(name):
+        events.append(("start", name))
+        try:
+            yield
+        finally:
+            events.append(("end", name))
+
+    monkeypatch.setattr("vllm.v1.utils.record_function_or_nullcontext", scope)
+    with alignment_phase(None, "forward"):
+        pass
+    assert events == []
+    with pytest.raises(RuntimeError), alignment_phase(7, "draft"):
+        raise RuntimeError("failed draft")
+    assert events == [
+        ("start", "vllm_iteration(7): draft"),
+        ("end", "vllm_iteration(7): draft"),
+    ]
 
 
 def test_token_spans_follow_the_scheduled_counts_not_equal_shares():

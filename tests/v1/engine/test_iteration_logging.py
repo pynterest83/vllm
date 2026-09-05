@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import time
 from types import SimpleNamespace
+
+import pytest
 
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.core import EngineCore
@@ -86,3 +89,66 @@ def test_attach_iteration_details_falls_back_to_client_zero_without_outputs():
     assert set(outputs) == {0}
     assert outputs[0].scheduler_stats is not None
     assert outputs[0].scheduler_stats.iteration_details == iteration_details
+
+
+def test_alignment_iteration_preserves_speculative_progress(monkeypatch):
+    records = []
+    monkeypatch.setattr(
+        "vllm.v1.engine.core.logger.info", lambda *args: records.append(args)
+    )
+    engine = make_fake_engine(log_stats=False)
+    scheduled = SimpleNamespace(
+        total_num_scheduled_tokens=8,
+        scheduled_new_reqs=[],
+        num_scheduled_tokens={"prefill": 2, "decode": 6},
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["prefill", "decode"],
+            num_computed_tokens=[16, 100],
+            num_output_tokens=[0, 9],
+            is_context_phase=lambda req_id: req_id == "prefill",
+        ),
+        scheduled_spec_decode_tokens={"decode": [1, 2, 3, 4, 5]},
+        scheduled_encoder_input_stats=None,
+    )
+    EngineCore.assign_alignment_iteration_index(engine, scheduled)
+    with EngineCore.log_iteration_details(engine, scheduled) as observation:
+        observation["model_output"] = SimpleNamespace(
+            req_id_to_index={"decode": 0}, sampled_token_ids=[[7, 8, 9]]
+        )
+    encoded = next(
+        args[1] for args in records if args[0] == "VibeSimAlignmentIteration %s"
+    )
+    record = json.loads(encoded)
+    assert record["schema_version"] == 4
+    assert record["iteration_index"] == scheduled.alignment_iteration_index == 0
+    assert record["prefill_chunk_pairs"] == [[16, 2]]
+    assert record["decode_query_lens"] == [6]
+    assert record["decode_request_progress"] == [
+        {
+            "engine_request_id": "decode",
+            "kv_len": 100,
+            "query_len": 6,
+            "output_tokens_before": 9,
+            "drafted_tokens": 5,
+            "accepted_draft_tokens": 2,
+            "emitted_tokens": 3,
+        }
+    ]
+    assert record["observed_end_monotonic_ns"] >= record["observed_start_monotonic_ns"]
+    EngineCore.assign_alignment_iteration_index(engine, scheduled)
+    assert scheduled.alignment_iteration_index == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_alignment_zero_token_step_does_not_emit_an_iteration(monkeypatch, enabled):
+    records = []
+    monkeypatch.setattr(
+        "vllm.v1.engine.core.logger.info", lambda *args: records.append(args)
+    )
+    engine = make_fake_engine()
+    engine.vllm_config.observability_config.enable_logging_iteration_details = enabled
+    with EngineCore.log_iteration_details(
+        engine, SimpleNamespace(total_num_scheduled_tokens=0)
+    ) as observation:
+        assert observation == {}
+    assert records == []
