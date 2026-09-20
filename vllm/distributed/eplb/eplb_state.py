@@ -496,7 +496,11 @@ class EplbState:
         )
         self._propagate_shared_tensors(model, num_unpadded_tokens_tensors)
         expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
-        experts_per_token_values = {layer.top_k for layer in model.moe_layers}
+        # `moe_layers` is a sequence of `MoERunner`, which carries the routing
+        # width on its `moe_config`; `top_k` was the pre-runner attribute name.
+        experts_per_token_values = {
+            layer.moe_config.experts_per_token for layer in model.moe_layers
+        }
         assert len(experts_per_token_values) == 1, (
             "all EPLB-managed MoE layers must use the same experts_per_token"
         )
