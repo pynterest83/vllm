@@ -75,6 +75,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.alignment import iteration_request_details
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -606,78 +607,6 @@ class EngineCore:
             )
         )
         if scheduler_output is not None:
-            cached_requests = scheduler_output.scheduled_cached_reqs
-            prefill_chunk_pairs = []
-            for new_request in scheduler_output.scheduled_new_reqs:
-                appended_tokens = scheduler_output.num_scheduled_tokens.get(
-                    new_request.req_id, 0
-                )
-                if appended_tokens > 0:
-                    prefill_chunk_pairs.append(
-                        [new_request.num_computed_tokens, appended_tokens]
-                    )
-            for request_index, request_id in enumerate(cached_requests.req_ids):
-                if cached_requests.is_context_phase(request_id):
-                    appended_tokens = scheduler_output.num_scheduled_tokens.get(
-                        request_id, 0
-                    )
-                    if appended_tokens > 0:
-                        prefill_chunk_pairs.append(
-                            [
-                                cached_requests.num_computed_tokens[request_index],
-                                appended_tokens,
-                            ]
-                        )
-            decode_kv_lens = [
-                cached_requests.num_computed_tokens[request_index]
-                for request_index, request_id in enumerate(cached_requests.req_ids)
-                if not cached_requests.is_context_phase(request_id)
-                and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
-            ]
-            decode_query_lens = [
-                scheduler_output.num_scheduled_tokens[request_id]
-                for request_id in cached_requests.req_ids
-                if not cached_requests.is_context_phase(request_id)
-                and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
-            ]
-            model_output = observation.get("model_output")
-            decode_request_progress = []
-            if model_output is not None:
-                for request_index, request_id in enumerate(cached_requests.req_ids):
-                    query_len = scheduler_output.num_scheduled_tokens.get(request_id, 0)
-                    if cached_requests.is_context_phase(request_id) or query_len <= 0:
-                        continue
-                    output_index = model_output.req_id_to_index[request_id]
-                    emitted_tokens = len(model_output.sampled_token_ids[output_index])
-                    drafted_tokens = len(
-                        scheduler_output.scheduled_spec_decode_tokens.get(
-                            request_id, ()
-                        )
-                    )
-                    accepted_draft_tokens = (
-                        max(emitted_tokens - 1, 0) if drafted_tokens else 0
-                    )
-                    if accepted_draft_tokens > drafted_tokens:
-                        raise ValueError(
-                            "alignment speculative acceptance exceeds drafted tokens: "
-                            f"request={request_id!r} accepted={accepted_draft_tokens} "
-                            f"drafted={drafted_tokens}"
-                        )
-                    decode_request_progress.append(
-                        {
-                            "engine_request_id": request_id,
-                            "kv_len": cached_requests.num_computed_tokens[
-                                request_index
-                            ],
-                            "query_len": query_len,
-                            "output_tokens_before": (
-                                cached_requests.num_output_tokens[request_index]
-                            ),
-                            "drafted_tokens": drafted_tokens,
-                            "accepted_draft_tokens": accepted_draft_tokens,
-                            "emitted_tokens": emitted_tokens,
-                        }
-                    )
             alignment_record = {
                 "schema_version": 4,
                 "input_adapter": "vllm_text",
@@ -688,10 +617,14 @@ class EngineCore:
                 "prefill_tokens": iteration_details.num_ctx_tokens,
                 "decode_requests": iteration_details.num_generation_requests,
                 "decode_tokens_scheduled": (iteration_details.num_generation_tokens),
-                "prefill_chunk_pairs": prefill_chunk_pairs,
-                "decode_kv_lens": decode_kv_lens,
-                "decode_query_lens": decode_query_lens,
-                "decode_request_progress": decode_request_progress,
+                **iteration_request_details(
+                    scheduler_output,
+                    observation.get("model_output"),
+                    requests=self.scheduler.requests,
+                    request_ids_randomized=(
+                        not envs.VLLM_DISABLE_REQUEST_ID_RANDOMIZATION
+                    ),
+                ),
             }
             logger.info(
                 "VibeSimAlignmentIteration %s",

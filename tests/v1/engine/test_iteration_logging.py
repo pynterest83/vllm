@@ -30,7 +30,7 @@ def make_iteration_details() -> SchedulerIterationDetails:
     )
 
 
-def make_fake_engine(log_stats: bool = True) -> SimpleNamespace:
+def make_fake_engine(log_stats: bool = True, requests: dict | None = None):
     return SimpleNamespace(
         log_stats=log_stats,
         vllm_config=SimpleNamespace(
@@ -38,6 +38,7 @@ def make_fake_engine(log_stats: bool = True) -> SimpleNamespace:
                 enable_logging_iteration_details=True,
             )
         ),
+        scheduler=SimpleNamespace(requests=requests or {}),
     )
 
 
@@ -96,24 +97,33 @@ def test_alignment_iteration_preserves_speculative_progress(monkeypatch):
     monkeypatch.setattr(
         "vllm.v1.engine.core.logger.info", lambda *args: records.append(args)
     )
-    engine = make_fake_engine(log_stats=False)
+    # The scheduler's cached count can still hold an async placeholder, so the
+    # committed count is read from the live request instead.
+    engine = make_fake_engine(
+        log_stats=False,
+        requests={
+            "decode-8e9ffed8": SimpleNamespace(
+                num_output_tokens=9, is_finished=lambda: False
+            )
+        },
+    )
     scheduled = SimpleNamespace(
         total_num_scheduled_tokens=8,
         scheduled_new_reqs=[],
-        num_scheduled_tokens={"prefill": 2, "decode": 6},
+        num_scheduled_tokens={"prefill": 2, "decode-8e9ffed8": 6},
         scheduled_cached_reqs=SimpleNamespace(
-            req_ids=["prefill", "decode"],
+            req_ids=["prefill", "decode-8e9ffed8"],
             num_computed_tokens=[16, 100],
-            num_output_tokens=[0, 9],
+            num_output_tokens=[0, 12],
             is_context_phase=lambda req_id: req_id == "prefill",
         ),
-        scheduled_spec_decode_tokens={"decode": [1, 2, 3, 4, 5]},
+        scheduled_spec_decode_tokens={"decode-8e9ffed8": [1, 2, 3, 4, 5]},
         scheduled_encoder_input_stats=None,
     )
     EngineCore.assign_alignment_iteration_index(engine, scheduled)
     with EngineCore.log_iteration_details(engine, scheduled) as observation:
         observation["model_output"] = SimpleNamespace(
-            req_id_to_index={"decode": 0}, sampled_token_ids=[[7, 8, 9]]
+            req_id_to_index={"decode-8e9ffed8": 0}, sampled_token_ids=[[7, 8, 9]]
         )
     encoded = next(
         args[1] for args in records if args[0] == "VibeSimAlignmentIteration %s"
@@ -125,10 +135,12 @@ def test_alignment_iteration_preserves_speculative_progress(monkeypatch):
     assert record["decode_query_lens"] == [6]
     assert record["decode_request_progress"] == [
         {
-            "engine_request_id": "decode",
+            "engine_request_id": "decode-8e9ffed8",
+            "external_request_id": "decode",
             "kv_len": 100,
             "query_len": 6,
             "output_tokens_before": 9,
+            "request_finished_before": False,
             "drafted_tokens": 5,
             "accepted_draft_tokens": 2,
             "emitted_tokens": 3,
