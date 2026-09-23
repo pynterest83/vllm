@@ -88,6 +88,13 @@ class EPLBConfig:
     """
     Whether to use non-blocking EPLB.
     """
+    rearrange: bool = True
+    """
+    Whether EPLB moves experts between ranks. When False the initial placement
+    is kept for the whole run and EPLB only records expert load (for
+    `log_balancedness`): no transfer buffer is allocated, `profile_run` does not
+    rehearse a rearrangement, and no async worker is started.
+    """
 
     policy: EPLBPolicyOption = "default"
     """The policy type for expert parallel load balancing (EPLB)."""

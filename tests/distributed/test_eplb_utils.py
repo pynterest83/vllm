@@ -6,7 +6,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+import vllm.distributed.eplb.eplb_state as eplb_state_module
 from vllm.distributed.eplb.eplb_state import (
+    EplbState,
     _commit_eplb_maps,
     _commit_eplb_maps_for_layer,
 )
@@ -157,3 +159,24 @@ def test_commit_eplb_maps_for_layer():
 
     # Layer 1 untouched
     assert torch.equal(model_state.physical_to_logical_map[1], original_phy2log[1])
+
+
+def test_record_only_eplb_never_rearranges(monkeypatch):
+    """rearrange=False keeps the placement: no profile rehearsal, no interval
+    rearrangement, and no rearrangement-window recording."""
+    monkeypatch.setattr(eplb_state_module, "get_ep_group", MagicMock())
+    state = EplbState.__new__(EplbState)
+    state.rearranges = False
+    state.is_async = False
+    state.model_states = {}
+    state.expert_rearrangement_step = 10
+    state.expert_rearrangement_step_interval = 10
+    state.expert_load_window_size = 4
+    state.should_record_tensor = torch.tensor(True)
+    state.rearrange = MagicMock()
+
+    state.step(is_profile=True)
+    state.step()
+
+    state.rearrange.assert_not_called()
+    assert not state.should_record_tensor.item()
