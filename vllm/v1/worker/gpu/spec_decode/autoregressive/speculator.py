@@ -9,6 +9,9 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -46,6 +49,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.use_fused_multi_step_decode = False
+        # Set by the model runner when it binds an MTP drafter for
+        # routed-experts capture.
+        self.routed_experts_capturer: RoutedExpertsCapturer | None = None
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -326,6 +332,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             # Early exit.
             return self.draft_tokens[:num_reqs, :1]
 
+        # Only the prefill ran over the target's token rows; keep its routes.
+        capturer = self.routed_experts_capturer
+        held_routes = capturer.hold_draft_layers() if capturer is not None else None
+
         if self.pcp_manager is not None and not dummy_run:
             self.block_tables.gather_block_tables(
                 input_batch.idx_mapping, num_reqs_padded=num_reqs
@@ -381,6 +391,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             input_batch.seq_lens_cpu_upper_bound,
         )
         self.on_multi_step_decode_end(num_reqs)
+
+        if held_routes is not None:
+            assert capturer is not None
+            capturer.restore_draft_layers(held_routes)
 
         return self.draft_tokens[:num_reqs]
 

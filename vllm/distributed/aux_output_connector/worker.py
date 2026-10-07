@@ -79,6 +79,13 @@ class PendingAuxOutput:
     def process_output(self) -> dict[str, AuxRequestOutput]:
         return self.connector.process_output(self)
 
+    def refresh_draft_layers(self) -> None:
+        """Fill the MTP drafter's slots once the drafter has run this step.
+
+        Call on the main stream after propose and before enqueue_cpu_copy.
+        """
+        self.connector.capturer.refresh_draft_layers(self.routed_experts_gpu)
+
 
 class AuxOutputWorkerConnector:
     """Own capture, request tails, and backend resources on the output worker."""
@@ -134,6 +141,15 @@ class AuxOutputWorkerConnector:
             max_num_batched_tokens,
             vllm_config.max_concurrent_batches,
         )
+
+    @property
+    def capturer(self) -> RoutedExpertsCapturer:
+        return self._capturer
+
+    @property
+    def records_drafter(self) -> bool:
+        """Whether this step's routes include an MTP drafter's layers."""
+        return self._capturer.records_drafter
 
     def prepare_output(self, input_batch: InputBatch) -> PendingAuxOutput | None:
         """Snapshot one step's R3 tensor for asynchronous CPU transfer."""

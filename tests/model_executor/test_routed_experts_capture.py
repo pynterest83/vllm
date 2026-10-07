@@ -4,6 +4,7 @@ import types
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -494,3 +495,139 @@ def test_v2_model_runner_accepts_routed_experts(monkeypatch):
     unsupported = VllmConfig._get_v2_model_runner_unsupported_features(config)
 
     assert "routed experts capture" not in unsupported
+
+
+def _capture_config(spec_method: str | None, num_nextn_predict_layers: int = 1):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_total_num_hidden_layers=lambda: 3,
+            get_num_experts=lambda: 288,
+            get_num_experts_per_tok=lambda: 2,
+            hf_text_config=SimpleNamespace(
+                model_type="test",
+                num_nextn_predict_layers=num_nextn_predict_layers,
+            ),
+        ),
+        parallel_config=SimpleNamespace(data_parallel_rank=0, tensor_parallel_size=1),
+        speculative_config=(
+            None if spec_method is None else SimpleNamespace(method=spec_method)
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec_method", "num_layers", "records_drafter"),
+    [(None, 3, False), ("eagle3", 3, False), ("mtp", 4, True)],
+)
+def test_capture_layers_include_only_an_mtp_drafter(
+    monkeypatch, spec_method, num_layers, records_drafter
+):
+    import vllm.model_executor.layers.fused_moe.routed_experts_capturer as module
+
+    monkeypatch.setattr(module, "current_platform", SimpleNamespace(device_type="cpu"))
+
+    capturer = RoutedExpertsCapturer(8, _capture_config(spec_method))
+
+    assert capturer.shape_per_token == (num_layers, 2)
+    assert capturer.first_draft_layer == 3
+    assert capturer.records_drafter is records_drafter
+
+
+def test_hold_and_restore_keep_the_first_draft_pass():
+    capturer = _capturer_with_buffer(max_tokens=6, num_layers=4)
+    capturer.first_draft_layer = 3
+    capturer.device_buffer[:, 3] = torch.arange(12, dtype=torch.int32).view(6, 2)
+    target_before = capturer.device_buffer[:, :3].clone()
+
+    held = capturer.hold_draft_layers()
+    # A later draft pass runs one row per request over the first rows.
+    capturer.device_buffer[:2, 3] = 99
+    capturer.restore_draft_layers(held)
+
+    assert torch.equal(
+        capturer.device_buffer[:, 3], torch.arange(12, dtype=torch.int32).view(6, 2)
+    )
+    assert torch.equal(capturer.device_buffer[:, :3], target_before)
+
+
+def test_refresh_fills_only_the_drafter_slots_of_a_snapshot():
+    capturer = _capturer_with_buffer(max_tokens=6, num_layers=4)
+    capturer.first_draft_layer = 3
+    capturer.output_dtype = torch.uint16
+    capturer.device_buffer[:, :3] = 1
+    capturer.device_buffer[:, 3] = 2
+    snapshot = capturer.snapshot_routing_data(4)
+    # The drafter runs after the snapshot and writes this step's routes.
+    capturer.device_buffer[:, 3] = 7
+
+    capturer.refresh_draft_layers(snapshot)
+
+    assert snapshot.dtype == torch.uint16
+    assert snapshot.shape == (4, 4, 2)
+    assert torch.all(snapshot[:, :3] == 1)
+    assert torch.all(snapshot[:, 3] == 7)
+
+
+def test_pending_aux_output_refreshes_through_the_connector_capturer():
+    from vllm.distributed.aux_output_connector.worker import PendingAuxOutput
+
+    routed = torch.zeros((2, 4, 2), dtype=torch.uint16)
+    capturer = Mock()
+    pending = PendingAuxOutput(
+        connector=SimpleNamespace(capturer=capturer),
+        request_ids=["r"],
+        token_starts=np.array([0]),
+        query_start_loc=np.array([0, 2]),
+        routed_experts_gpu=routed,
+    )
+
+    pending.refresh_draft_layers()
+
+    capturer.refresh_draft_layers.assert_called_once_with(routed)
+
+
+def test_runner_binds_a_single_module_mtp_drafter(monkeypatch):
+    import vllm.v1.worker.gpu.model_runner as runner_module
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    bind = Mock()
+    monkeypatch.setattr(runner_module, "bind_routed_experts_capturer", bind)
+    speculator = MTPSpeculator.__new__(MTPSpeculator)
+    speculator.model = Mock()
+    capturer = Mock()
+    connector = SimpleNamespace(records_drafter=True, capturer=capturer)
+
+    runner_module.GPUModelRunner._bind_draft_routed_experts(
+        SimpleNamespace(speculator=speculator), connector
+    )
+
+    bind.assert_called_once_with(speculator.model, capturer)
+    assert speculator.routed_experts_capturer is capturer
+
+
+def test_runner_refuses_a_drafter_that_is_not_single_module(monkeypatch):
+    import vllm.v1.worker.gpu.model_runner as runner_module
+
+    bind = Mock()
+    monkeypatch.setattr(runner_module, "bind_routed_experts_capturer", bind)
+    connector = SimpleNamespace(records_drafter=True, capturer=Mock())
+
+    with pytest.raises(ValueError, match="single-module MTP drafter"):
+        runner_module.GPUModelRunner._bind_draft_routed_experts(
+            SimpleNamespace(speculator=Mock()), connector
+        )
+    bind.assert_not_called()
+
+
+def test_runner_skips_drafter_binding_without_drafter_slots(monkeypatch):
+    import vllm.v1.worker.gpu.model_runner as runner_module
+
+    bind = Mock()
+    monkeypatch.setattr(runner_module, "bind_routed_experts_capturer", bind)
+    connector = SimpleNamespace(records_drafter=False, capturer=Mock())
+
+    runner_module.GPUModelRunner._bind_draft_routed_experts(
+        SimpleNamespace(speculator=None), connector
+    )
+
+    bind.assert_not_called()

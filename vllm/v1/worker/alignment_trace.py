@@ -287,8 +287,12 @@ def dump_routing_summary(
     include_topk_ids = os.environ.get(ROUTING_TRACE_TOPK_IDS_ENV, "0") == "1"
     provenance = _device_provenance()
 
+    # This runs before the drafter, whose slots still hold the previous step.
+    num_target_layers = int(
+        getattr(capturer, "first_draft_layer", device_buffer.shape[1])
+    )
     for layer_id, layer_name, layer in _iter_moe_layers(static_forward_context):
-        if layer_id >= int(device_buffer.shape[1]):
+        if layer_id >= num_target_layers:
             continue
         topk_ids = device_buffer[:num_tokens, layer_id, :]
         if topk_ids.numel() == 0:

@@ -26,9 +26,31 @@ class RoutedExpertsCaptureSource(Protocol):
     capture_fn: Callable[[torch.Tensor], None] | None
 
 
+def num_target_layers(vllm_config: VllmConfig) -> int:
+    """Capture slots owned by the target model; an MTP drafter's slots follow."""
+    return vllm_config.model_config.get_total_num_hidden_layers()
+
+
+def num_capture_layers(vllm_config: VllmConfig) -> int:
+    """Capture slots for the target plus an MTP drafter's layers.
+
+    An MTP drafter registers its layers from the target's layer count onward
+    (``mtp_start_layer_idx``), so its routes need slots past the target's.
+    Only that drafter runs those layers; vLLM normalizes every MTP model type
+    to method ``"mtp"``. Any other drafter would leave a slot nothing writes,
+    which a consumer would read as a real route.
+    """
+    num_layers = num_target_layers(vllm_config)
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    if spec_config is not None and spec_config.method == "mtp":
+        hf_config = vllm_config.model_config.hf_text_config
+        num_layers += getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+    return num_layers
+
+
 def _get_routed_experts_shape(vllm_config: VllmConfig) -> tuple[int, int, int]:
     model_config = vllm_config.model_config
-    num_layers = model_config.get_total_num_hidden_layers()
+    num_layers = num_capture_layers(vllm_config)
     num_experts = model_config.get_num_experts()
     num_experts_per_tok = model_config.get_num_experts_per_tok()
     if num_layers <= 0 or num_experts <= 0 or num_experts_per_tok <= 0:
@@ -82,6 +104,39 @@ class RoutedExpertsCapturer:
         )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        # Slots from here on belong to an MTP drafter (see num_capture_layers).
+        self.first_draft_layer = num_target_layers(vllm_config)
+
+    @property
+    def records_drafter(self) -> bool:
+        """Whether the buffer has slots for an MTP drafter's layers."""
+        return self.first_draft_layer < self.device_buffer.shape[1]
+
+    def hold_draft_layers(self) -> torch.Tensor:
+        """Copy the drafter's slots as its first pass left them.
+
+        Only the first draft pass runs over the target's token rows; each later
+        pass runs one row per request and would write over the first
+        ``num_reqs`` token rows, attaching one request's draft routes to
+        another request's tokens. The write sits inside the MoE forward and is
+        replayed from CUDA graphs, so it cannot be switched off per pass. The
+        speculator holds the first pass's slots here and puts them back with
+        :meth:`restore_draft_layers` once drafting is done.
+        """
+        return self.device_buffer[:, self.first_draft_layer :].clone()
+
+    def restore_draft_layers(self, held: torch.Tensor) -> None:
+        """Undo every draft pass after the one :meth:`hold_draft_layers` saw."""
+        self.device_buffer[:, self.first_draft_layer :].copy_(held)
+
+    def refresh_draft_layers(self, snapshot: torch.Tensor) -> None:
+        """Copy this step's draft routes into a snapshot taken before drafting.
+
+        A step's snapshot is taken right after the target forward, when the
+        drafter's slots still hold the previous step's routes.
+        """
+        first = self.first_draft_layer
+        snapshot[:, first:].copy_(self.device_buffer[: snapshot.shape[0], first:])
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
         """Capture expert routing decisions for a specific layer.
@@ -190,7 +245,7 @@ def bind_routed_experts_capturer(
     model: torch.nn.Module,
     capturer: RoutedExpertsCapturer,
 ) -> None:
-    """Attach capture callbacks to the target model's MoE routers."""
+    """Attach capture callbacks to a model's MoE routers."""
     from vllm.model_executor.layers.fused_moe.layer import MoERunner
     from vllm.model_executor.layers.fused_moe.modular_kernel import (
         FusedMoEExpertsMonolithic,

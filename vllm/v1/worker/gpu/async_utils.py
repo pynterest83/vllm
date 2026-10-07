@@ -122,6 +122,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool,
         pending_aux_output: "PendingAuxOutput | None",
+        defer_aux_output_copy: bool = False,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -160,7 +161,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.prompt_token_id_logprobs_dict = {
                 k: v.to("cpu", non_blocking=True) for k, v in token_id_logprobs.items()
             }
-            if self.pending_aux_output is not None:
+            # An MTP drafter's routes exist only once it has run; the runner
+            # then calls enqueue_deferred_aux_output_copy.
+            self._aux_output_copy_deferred = defer_aux_output_copy
+            if self.pending_aux_output is not None and not defer_aux_output_copy:
                 self.pending_aux_output.enqueue_cpu_copy(
                     num_sampled=self.num_sampled_tokens_np,
                     num_rejected=async_copy_to_np(sampler_output.num_rejected),
@@ -168,6 +172,20 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
+            self.copy_event.record(copy_stream)
+
+    def enqueue_deferred_aux_output_copy(
+        self, main_stream: torch.cuda.Stream, copy_stream: torch.cuda.Stream
+    ) -> None:
+        """Copy routes completed after construction (MTP drafter layers)."""
+        assert self.pending_aux_output is not None and self._aux_output_copy_deferred
+        self._aux_output_copy_deferred = False
+        with stream(copy_stream, main_stream):
+            copy_stream.wait_stream(main_stream)
+            self.pending_aux_output.enqueue_cpu_copy(
+                num_sampled=self.num_sampled_tokens_np,
+                num_rejected=async_copy_to_np(self.sampler_output.num_rejected),
+            )
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:

@@ -41,6 +41,9 @@ from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    bind_routed_experts_capturer,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -166,6 +169,9 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     get_max_chunk_logits,
+)
+from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
@@ -582,6 +588,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 kv_cache_spec[name] = replace(kv_cache_spec[name], dcp_sharded=False)
         return kv_cache_spec
 
+    def _bind_draft_routed_experts(self, connector: AuxOutputWorkerConnector) -> None:
+        """Capture an MTP drafter's routes into the slots past the target's."""
+        if not connector.records_drafter:
+            return
+        # A multi-module drafter runs a different layer per pass, so its later
+        # layers see one row per request instead of the target's token rows.
+        speculator = self.speculator
+        if not isinstance(speculator, AutoRegressiveSpeculator):
+            raise ValueError(
+                "Routed-experts capture records MTP drafter layers only with a "
+                f"single-module MTP drafter, got {type(speculator).__name__}."
+            )
+        bind_routed_experts_capturer(speculator.model, connector.capturer)
+        speculator.routed_experts_capturer = connector.capturer
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -776,6 +797,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.aux_output_connector = get_aux_output_connector(
                     self.model, self.vllm_config, kv_cache_config
                 )
+                self._bind_draft_routed_experts(self.aux_output_connector)
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -2188,6 +2210,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         pending_aux_output = None
         if self.aux_output_connector is not None:
             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
+        # An MTP drafter's routes exist only once it has run.
+        draft_routes_pending = (
+            pending_aux_output is not None
+            and self.speculator is not None
+            and self.aux_output_connector is not None
+            and self.aux_output_connector.records_drafter
+        )
 
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -2198,6 +2227,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
+            defer_aux_output_copy=draft_routes_pending,
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -2274,6 +2304,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         phases.switch(iteration_index, "bookkeep")
+        if draft_routes_pending:
+            assert pending_aux_output is not None
+            pending_aux_output.refresh_draft_layers()
+            async_output.enqueue_deferred_aux_output_copy(
+                self.main_stream, self.output_copy_stream
+            )
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
