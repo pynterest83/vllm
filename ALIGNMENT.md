@@ -1,9 +1,14 @@
 # ServingStudio instrumentation on upstream vLLM
 
-`servingstudio-alignment` is the one maintained ServingStudio line of this fork.
-It sits on official vLLM `upstream/main`; the current upstream base is
-`8369affa5428ca29a30f378d660fbffbad12e240` (v0.28.1rc0). ServingStudio Sim pins
-it at `alignment/profiler/vllm`.
+`servingstudio-alignment-v0.31.0` carries the ServingStudio instrumentation on
+the upstream release tag `v0.31.0` (`db9527a46873454610df6dbedf79a36d6bf1a7f6`),
+the vLLM release that serves GLM-5.3-Flash on Hopper. It ports the
+`servingstudio-alignment` line (base `8369affa`, v0.28.1rc0); ServingStudio Sim
+checks the instrumented fork out at `alignment/profiler/vllm`.
+
+v0.31 moved routed-experts capture into the AuxOutput connector, so the MTP
+drafter's capture slots are implemented on that connector rather than on the
+former `RoutedExpertsCapturer` API. The v0.28 `AsyncLLM.profiler` fix is upstream.
 
 It converges two earlier lines:
 
@@ -46,7 +51,7 @@ or native extensions. The installation used:
 ```bash
 uv venv --python 3.12 .venv
 VLLM_USE_PRECOMPILED=1 \
-VLLM_PRECOMPILED_WHEEL_COMMIT=8369affa5428ca29a30f378d660fbffbad12e240 \
+VLLM_PRECOMPILED_WHEEL_COMMIT=db9527a46873454610df6dbedf79a36d6bf1a7f6 \
 VLLM_PRECOMPILED_WHEEL_VARIANT=cu130 \
 uv pip install --python .venv/bin/python -e .
 uv pip install --python .venv/bin/python -r requirements/lint.txt \
@@ -62,10 +67,13 @@ ServingStudio's profiler runs `alignment/profiler/vllm/.venv/bin/python` by
 default. Run pre-commit checks explicitly in this checkout; do not replace
 shared Git hooks with a hook that points at this environment.
 
-The native wheel selected by the fixed commit's official `cu130` metadata is
-also saved in `../glm53-dflash2-artifacts/`. If that metadata endpoint is
-temporarily unavailable, set `VLLM_PRECOMPILED_WHEEL_LOCATION` to the path in
-`vllm-wheel-path.txt`. `native-wheel.json` records its SHA256 and provenance.
+The native wheel comes from the fixed commit's official `cu130` metadata. If
+that endpoint is unavailable, set `VLLM_PRECOMPILED_WHEEL_LOCATION` to a saved
+copy of the same wheel.
+
+On Hopper, GLM-5.3-Flash needs a BF16 KV cache (`--kv-cache-dtype auto`): no
+sparse-MLA backend in this release accepts an FP8 KV cache with a 512-wide NoPE
+latent on SM90.
 
 ## Frozen models
 
