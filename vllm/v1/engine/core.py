@@ -48,6 +48,10 @@ from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+from vllm.v1.core.block_pool_counters import (
+    block_pool_counters_enabled,
+    take_block_pool_record,
+)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
@@ -626,6 +630,11 @@ class EngineCore:
                     ),
                 ),
             }
+            if block_pool_counters_enabled():
+                # Opt-in diagnostic: per-KV-group block-pool deltas + gauges.
+                block_pool_record = take_block_pool_record(self.scheduler)
+                if block_pool_record is not None:
+                    alignment_record["block_pool"] = block_pool_record
             logger.info(
                 "VibeSimAlignmentIteration %s",
                 json.dumps(alignment_record, separators=(",", ":")),

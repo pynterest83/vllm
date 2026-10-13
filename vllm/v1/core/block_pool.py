@@ -12,6 +12,10 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.core.block_pool_counters import (
+    BlockPoolCounters,
+    block_pool_counters_enabled,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -164,6 +168,11 @@ class BlockPool:
         medium: str = MEDIUM_GPU,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+        # Opt-in diagnostic counters (VLLM_VIBESIM_BLOCK_POOL_COUNTERS=1);
+        # None by default, so every hook below is a no-op.
+        self.vibesim_counters: BlockPoolCounters | None = (
+            BlockPoolCounters() if block_pool_counters_enabled() else None
+        )
         self.num_gpu_blocks = num_gpu_blocks
         self.medium = medium
         self.enable_caching = enable_caching
@@ -290,6 +299,8 @@ class BlockPool:
                     blk.block_hash_num_tokens is not None
                     and blk.block_hash_num_tokens < num_hash_tokens
                 )
+                if self.vibesim_counters is not None:
+                    self.vibesim_counters.on_rehash(self.vibesim_counters.group_of(blk))
                 removed_hashes = self._remove_cached_block_hashes(blk)
                 self._emit_block_removed_events(removed_hashes)
             self._insert_block_hash(
@@ -508,6 +519,8 @@ class BlockPool:
             )
         )
         if replace_existing_hashes:
+            if self.vibesim_counters is not None and block.block_hash is not None:
+                self.vibesim_counters.on_rehash(self.vibesim_counters.group_of(block))
             removed_hashes = self._remove_cached_block_hashes(block)
             self._emit_block_removed_events(removed_hashes)
             already_cached = False
@@ -517,6 +530,8 @@ class BlockPool:
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
         ):
+            if self.vibesim_counters is not None:
+                self.vibesim_counters.on_rehash(self.vibesim_counters.group_of(block))
             removed_hashes = self._remove_cached_block_hashes(block)
             self._emit_block_removed_events(removed_hashes)
         self._insert_block_hash(
@@ -608,6 +623,10 @@ class BlockPool:
                 is not None
             ):
                 removed_hashes.append(block_hash)
+        if self.vibesim_counters is not None and block.block_hash is not None:
+            self.vibesim_counters.on_hashes_removed(
+                block, get_group_id(block.block_hash)
+            )
         block.reset_hash()
         return removed_hashes
 
@@ -642,6 +661,10 @@ class BlockPool:
 
         if block.block_hash is None:
             block.set_block_hash(block_hash_with_group_id, num_tokens=num_tokens)
+            if self.vibesim_counters is not None:
+                self.vibesim_counters.on_hash_inserted(
+                    block, get_group_id(block_hash_with_group_id)
+                )
         else:
             self.cached_block_hashes_by_block.setdefault(block.block_id, set()).add(
                 block_hash_with_group_id
@@ -681,6 +704,11 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        counters = self.vibesim_counters
+        if counters is not None:
+            # Attribute the allocation to the calling single-type manager.
+            counters.begin_alloc(1)
+
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         if self._reuse_watchers:
@@ -700,6 +728,8 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        if counters is not None:
+            counters.end_alloc(ret)
         return ret
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
@@ -728,6 +758,8 @@ class BlockPool:
             if block.ref_cnt == 0:
                 released.append(block)
         self.free_block_queue.append_n(released)
+        if self.vibesim_counters is not None:
+            self.vibesim_counters.on_released(released)
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """If a block is cached in `cached_block_hash_to_block`, we reset its hash
@@ -744,11 +776,17 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
+        counters = self.vibesim_counters
+        if counters is not None:
+            victim_group = counters.group_of(block)
+
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
 
+        if counters is not None:
+            counters.on_evict(victim_group, len(evicted_hashes))
         self._emit_block_removed_events(evicted_hashes)
         return True
 
@@ -761,11 +799,16 @@ class BlockPool:
             blocks: A list of blocks to touch.
 
         """
+        counters = self.vibesim_counters
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                if counters is not None:
+                    counters.on_touch(block, was_free=True)
+            elif counters is not None and not block.is_null:
+                counters.on_touch(block, was_free=False)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -804,6 +847,9 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+        if self.vibesim_counters is not None:
+            self.vibesim_counters.on_released(blocks_to_evict_first)
+            self.vibesim_counters.on_released(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
 
@@ -860,6 +906,8 @@ class BlockPool:
 
         if self.metrics_collector:
             self.metrics_collector.reset()
+        if self.vibesim_counters is not None:
+            self.vibesim_counters.on_reset()
 
         logger.info("Successfully reset prefix cache")
 
