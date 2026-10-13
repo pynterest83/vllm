@@ -72,12 +72,14 @@ class FakeState:
         self.kv_indptr = torch.zeros(max_tokens + 1, dtype=torch.int32)
         self.wrapper = FakeWrapper()
         self.plan_calls = []
+        self.row_offsets = []
         self.index_topk = 2048
         self.index_kpool = 4
         self.max_valid = 2051
 
-    def plan(self, num_tokens, kv_lens, cam, req_id_per_token):
+    def plan(self, num_tokens, kv_lens, cam, req_id_per_token, row_offset=0):
         self.plan_calls.append((num_tokens, kv_lens))
+        self.row_offsets.append(row_offset)
 
     def pack_indices(self, slots):
         for row in range(slots.shape[0]):

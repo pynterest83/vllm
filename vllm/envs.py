@@ -298,6 +298,8 @@ if TYPE_CHECKING:
     VLLM_NCCL_INCLUDE_PATH: str | None = None
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
+    VLLM_FP8_KV_PREFILL_BF16_WORKSPACE: bool = False
+    VLLM_FP8_KV_PREFILL_BF16_WORKSPACE_TOKENS: int = 0
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
@@ -2051,6 +2053,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug workspace allocations.
     # logging of workspace resize operations.
     "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
+    # FLASHINFER_MLA_SPARSE_SM90 with an FP8 KV cache: dequantize the context
+    # of prefilling requests into a BF16 workspace each layer and run their
+    # rows through a BF16 FlashInfer plan (decode rows stay on the FP8 plan).
+    "VLLM_FP8_KV_PREFILL_BF16_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_FP8_KV_PREFILL_BF16_WORKSPACE", "0"))
+    ),
+    # Token capacity of that BF16 workspace; batches whose prefill contexts
+    # exceed it fall back to the FP8 plan. 0 = min(max_model_len, 262144) +
+    # max_num_batched_tokens.
+    "VLLM_FP8_KV_PREFILL_BF16_WORKSPACE_TOKENS": lambda: int(
+        os.getenv("VLLM_FP8_KV_PREFILL_BF16_WORKSPACE_TOKENS", "0")
+    ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
@@ -2305,6 +2319,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
+        # Select an attention custom-op runtime path and its workspace size;
+        # the compiled graph treats attention as an opaque splitting op.
+        "VLLM_FP8_KV_PREFILL_BF16_WORKSPACE",
+        "VLLM_FP8_KV_PREFILL_BF16_WORKSPACE_TOKENS",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache

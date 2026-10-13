@@ -30,6 +30,18 @@ KV cache format: plain contiguous E4M3 ``[num_blocks, block_size, 512]``
 (uint8 storage) with a per-tensor ``k_scale``; BF16 caches also work. The
 per-token x 128-channel-group ``ckv_scale_arr`` layout is supported by the
 kernel but not wired yet (it needs a group-quantizing cache-write op).
+
+FP8 prefill BF16 workspace (``VLLM_FP8_KV_PREFILL_BF16_WORKSPACE=1``, default
+off): FlashInfer's Hopper kernel is several times slower per prefill row with
+an E4M3 cache than with a BF16 one. With the flag on, each layer dequantizes
+the whole context of the batch's prefilling requests into a BF16 workspace
+(``gather_and_maybe_dequant_cache``), the index conversion maps prefill rows
+to workspace positions instead of cache slots, and those rows run through a
+second, BF16 plan; decode rows keep the FP8 plan, so decode CUDA graphs are
+unchanged (prefill batches never take the full-graph path: UNIFORM_BATCH).
+Batches whose prefill contexts exceed the workspace fall back to the FP8 plan.
+E4M3 -> BF16 is exact, so with ``k_scale == 1`` both plans see identical K/V
+values.
 """
 
 from dataclasses import dataclass
@@ -37,8 +49,11 @@ from typing import Any, ClassVar
 
 import torch
 
+import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
 )
@@ -61,7 +76,99 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
+logger = init_logger(__name__)
+
 _FP8_KV_DTYPES = ("fp8", "fp8_e4m3")
+# Default prefill workspace context cap: one 262144-token context plus a full
+# scheduler step of new prefill tokens.
+_PREFILL_WS_MAX_CONTEXT = 262144
+
+
+def prefill_workspace_tokens(
+    enabled: bool,
+    use_fp8_kv_cache: bool,
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    override: int = 0,
+) -> int:
+    """Token capacity of the BF16 prefill workspace; 0 disables it.
+
+    The prefill rows of one step read at most the summed contexts of the
+    step's prefilling requests. Every request's context is <= max_model_len
+    and at most ``max_num_batched_tokens`` of it is new this step, so the
+    default covers any batch while max_model_len <= 262144.
+    """
+    if not (enabled and use_fp8_kv_cache):
+        return 0
+    if override > 0:
+        return override
+    return min(max_model_len, _PREFILL_WS_MAX_CONTEXT) + max_num_batched_tokens
+
+
+@dataclass
+class PrefillWorkspaceLayout:
+    """Host layout of one step's BF16 prefill workspace.
+
+    Prefill request ``i`` (batch request ``num_decodes + i``) owns workspace
+    rows ``[cu_seq_lens[i], cu_seq_lens[i + 1])``: its whole context in
+    position order, so request-local top-k position ``p`` lives at
+    ``cu_seq_lens[i] + p``. ``request_ids`` maps every query row to its
+    prefill request index, -1 for decode rows.
+    """
+
+    num_decode_tokens: int
+    num_tokens: int
+    cu_seq_lens: torch.Tensor  # int32 [num_prefills + 1]
+    request_ids: torch.Tensor  # int32 [num_rows]
+
+
+def plan_prefill_workspace(
+    query_start_loc_cpu: torch.Tensor,
+    prefill_seq_lens_cpu: torch.Tensor,
+    num_decodes: int,
+    budget_tokens: int,
+) -> PrefillWorkspaceLayout | None:
+    """Lay out the prefill contexts, or None when they exceed the budget.
+
+    ``query_start_loc_cpu`` covers all ``num_decodes + num_prefills`` requests
+    (decodes first, as the batch is reordered); ``prefill_seq_lens_cpu`` holds
+    the prefill requests' context lengths (exact on the host for prefills).
+    """
+    num_reqs = query_start_loc_cpu.shape[0] - 1
+    num_prefills = num_reqs - num_decodes
+    assert prefill_seq_lens_cpu.shape[0] == num_prefills
+    if num_prefills <= 0:
+        return None
+    seq_lens = prefill_seq_lens_cpu.to(torch.int64)
+    num_tokens = int(seq_lens.sum())
+    if num_tokens > budget_tokens or num_tokens <= 0:
+        return None
+    cu = torch.zeros(num_prefills + 1, dtype=torch.int32)
+    torch.cumsum(seq_lens, dim=0, out=cu[1:])
+    qsl = query_start_loc_cpu.to(torch.int64)
+    num_decode_tokens = int(qsl[num_decodes])
+    num_rows = int(qsl[-1])
+    q_lens = qsl[num_decodes + 1 :] - qsl[num_decodes:-1]
+    request_ids = torch.full((num_rows,), -1, dtype=torch.int32)
+    request_ids[num_decode_tokens:] = torch.repeat_interleave(
+        torch.arange(num_prefills, dtype=torch.int32), q_lens
+    )
+    return PrefillWorkspaceLayout(num_decode_tokens, num_tokens, cu, request_ids)
+
+
+@dataclass
+class PrefillWorkspaceMetadata:
+    """Device side of a :class:`PrefillWorkspaceLayout` for one step."""
+
+    num_decode_tokens: int
+    num_tokens: int
+    cu_seq_lens: torch.Tensor  # int32 [num_prefills + 1], device
+    request_ids: torch.Tensor  # int32 [num_rows], device
+    block_table: torch.Tensor  # int32 [num_prefills, max_blocks], device
+
+    @property
+    def workspace_starts(self) -> torch.Tensor:
+        return self.cu_seq_lens[:-1]
 
 
 def _planned_kv_data_type(
@@ -128,15 +235,17 @@ def _clamp_work_kv_end(
     q_indptr_off,
     kv_start_off,
     kv_end_off,
+    row_offset,
     TOPK: tl.constexpr,
     KPOOL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     # Clamp each planned work item to its row's exact valid count, derived
     # from the device batch layout exactly as the convert kernel counts it.
+    # Plan row r is batch row r + row_offset (a plan may cover a suffix).
     works = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = works < tl.load(int_ws + num_works_idx)
-    row = tl.load(int_ws + q_indptr_off + works, mask=mask, other=0)
+    row = tl.load(int_ws + q_indptr_off + works, mask=mask, other=0) + row_offset
     req = tl.load(req_id_per_token + row, mask=mask, other=0)
     seq_len = tl.load(seq_lens + req, mask=mask, other=0)
     query_end = tl.load(query_start_loc + req + 1, mask=mask, other=0)
@@ -261,10 +370,19 @@ class _SM90State:
         sm_scale: float,
         index_topk: int,
         index_kpool: int,
+        float_workspace: torch.Tensor | None = None,
+        kv_indices: torch.Tensor | None = None,
     ) -> None:
+        """``float_workspace`` / ``kv_indices`` let a second state share the
+        first's buffers: both are scratch rewritten right before each run, so
+        states whose runs are serialized on one stream can share them."""
         from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
-        self.workspace = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        self.workspace = (
+            float_workspace
+            if float_workspace is not None
+            else torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        )
         self.device = device
         self.num_heads = num_heads
         self.kv_dtype = kv_dtype
@@ -279,8 +397,10 @@ class _SM90State:
         self.max_valid = min(self.index_topk + self.index_kpool - 1, topk_width)
         # User-reserved buffers: with use_cuda_graph=True plan() refreshes
         # these in place, so run()'s captured kernels always read them.
-        self.kv_indices = torch.zeros(
-            max_tokens * topk_width, dtype=torch.int32, device=device
+        self.kv_indices = (
+            kv_indices
+            if kv_indices is not None
+            else torch.zeros(max_tokens * topk_width, dtype=torch.int32, device=device)
         )
         self.kv_len_arr = torch.full(
             (max_tokens,), topk_width, dtype=torch.int32, device=device
@@ -314,6 +434,7 @@ class _SM90State:
         kv_lens: torch.Tensor,
         cam: CommonAttentionMetadata | None,
         req_id_per_token: torch.Tensor | None,
+        row_offset: int = 0,
     ) -> None:
         """Plan per-row KV lengths (CPU int32, ``[num_tokens]``).
 
@@ -324,11 +445,12 @@ class _SM90State:
         valid counts: the plan is padded by ``_PLAN_SLACK`` and reused while
         the bound still fits, and every call clamps each work item's kv_end
         on device to the exact count, so no D2H sync is needed. Without them
-        the lengths must be exact. Must run outside CUDA graph capture: the
-        in-place refreshed plan_info/indptr buffers are what captured runs
-        read.
+        the lengths must be exact. ``row_offset`` is the batch row of plan
+        row 0 when the plan covers a row suffix (the prefill rows). Must run
+        outside CUDA graph capture: the in-place refreshed plan_info/indptr
+        buffers are what captured runs read.
         """
-        if torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "FlashInferMLASparseSM90 plan() called inside CUDA graph "
                 "capture; lengths must be planned host-side before capture."
@@ -346,7 +468,7 @@ class _SM90State:
                 num_tokens, torch.clamp(kv_lens + _PLAN_SLACK, max=self.max_valid)
             )
             self._planned_num_tokens = num_tokens
-        self._clamp_kv_end(cam, req_id_per_token)
+        self._clamp_kv_end(cam, req_id_per_token, row_offset)
 
     def _plan(self, num_tokens: int, kv_lens: torch.Tensor) -> None:
         # CPU staging buffers are filled in place: plan() runs per step
@@ -403,7 +525,10 @@ class _SM90State:
         self._saved_kv_end.copy_(self._int_ws[kv_end_off : kv_end_off + max_works])
 
     def _clamp_kv_end(
-        self, cam: CommonAttentionMetadata, req_id_per_token: torch.Tensor
+        self,
+        cam: CommonAttentionMetadata,
+        req_id_per_token: torch.Tensor,
+        row_offset: int = 0,
     ) -> None:
         assert self._int_ws is not None and self._plan_offsets is not None
         block = 1024
@@ -414,6 +539,7 @@ class _SM90State:
             cam.query_start_loc,
             req_id_per_token,
             *self._plan_offsets,
+            row_offset,
             TOPK=self.index_topk,
             KPOOL=self.index_kpool,
             BLOCK_SIZE=block,
@@ -429,12 +555,18 @@ class _SM90State:
 @dataclass
 class FlashInferMLASparseSM90Metadata(FlashInferMLASparseMetadata):
     state: _SM90State | None = None
+    # Set when this step's prefill rows run on the BF16 workspace plan.
+    prefill_state: _SM90State | None = None
+    prefill_ws: PrefillWorkspaceMetadata | None = None
 
 
 class FlashInferMLASparseSM90Builder(FlashInferMLASparseMetadataBuilder):
     """Reuse the common sparse metadata (req ids, topk buffer access)."""
 
     metadata_cls = FlashInferMLASparseSM90Metadata
+    # BF16 plan for prefill rows over the dequantized workspace (None = off).
+    prefill_state: _SM90State | None = None
+    prefill_ws_tokens: int = 0
 
     def __init__(
         self,
@@ -470,6 +602,25 @@ class FlashInferMLASparseSM90Builder(FlashInferMLASparseMetadataBuilder):
             index_topk=int(hf_config.index_topk),
             index_kpool=int(getattr(hf_config, "index_kpool", 1) or 1),
         )
+        # The impl reserved the workspace at model init (profiled memory);
+        # the second plan shares the first's float workspace and index
+        # buffer, since prefill runs follow decode runs on the same stream.
+        self.prefill_ws_tokens = int(getattr(impl, "prefill_ws_tokens", 0))
+        if self.prefill_ws_tokens > 0:
+            self.prefill_state = _SM90State(
+                device,
+                impl.num_heads,
+                torch.bfloat16,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                topk_indices_buffer.shape[1],
+                kv_lora_rank=impl.kv_lora_rank,
+                qk_rope_head_dim=impl.qk_rope_head_dim,
+                sm_scale=impl.scale,
+                index_topk=int(hf_config.index_topk),
+                index_kpool=int(getattr(hf_config, "index_kpool", 1) or 1),
+                float_workspace=self.state.workspace,
+                kv_indices=self.state.kv_indices,
+            )
         spec_config = vllm_config.speculative_config
         self._adaptive_verification = bool(
             spec_config is not None and spec_config.enable_adaptive_verification
@@ -523,6 +674,66 @@ class FlashInferMLASparseSM90Builder(FlashInferMLASparseMetadataBuilder):
         rows = torch.arange(int(qsl[-1]), dtype=torch.int64)
         return first_ctx[req_of_row] + rows - qsl.to(torch.int64)[req_of_row]
 
+    def _build_prefill_ws(
+        self,
+        cam: CommonAttentionMetadata,
+        metadata: FlashInferMLASparseSM90Metadata,
+    ) -> PrefillWorkspaceMetadata | None:
+        """Workspace layout for this step's prefill rows, or None to keep
+        them on the FP8 plan (no prefill, DCP, or over the token budget)."""
+        if self.prefill_state is None or metadata.num_prefills == 0:
+            return None
+        if getattr(self, "dcp_world_size", 1) > 1:
+            return None
+        num_reqs = cam.num_reqs
+        num_decodes = metadata.num_decodes
+        assert num_decodes + metadata.num_prefills == num_reqs
+        qsl = cam.query_start_loc_cpu[: num_reqs + 1]
+        assert int(qsl[num_decodes]) == metadata.num_decode_tokens
+        # seq_lens_cpu_upper_bound is precise for prefill rows.
+        sl_host = cam.seq_lens_cpu_upper_bound
+        prefill_sl = (
+            sl_host[num_decodes:num_reqs]
+            if sl_host is not None
+            else cam.seq_lens[num_decodes:num_reqs].cpu()
+        )
+        layout = plan_prefill_workspace(
+            qsl, prefill_sl, num_decodes, self.prefill_ws_tokens
+        )
+        if layout is None:
+            return None
+        to_device = self._to_device
+        return PrefillWorkspaceMetadata(
+            num_decode_tokens=layout.num_decode_tokens,
+            num_tokens=layout.num_tokens,
+            cu_seq_lens=to_device(layout.cu_seq_lens),
+            request_ids=to_device(layout.request_ids),
+            block_table=metadata.block_table[num_decodes:num_reqs],
+        )
+
+    def _to_device(self, t: torch.Tensor) -> torch.Tensor:
+        # Fresh pinned staging per step: the caching host allocator keeps the
+        # block alive until the async copy completes.
+        device = self.state.device
+        if device.type == "cpu":
+            return t
+        return t.pin_memory().to(device, non_blocking=True)
+
+    @staticmethod
+    def _plan_state(
+        state: _SM90State,
+        num_rows: int,
+        kv_lens: torch.Tensor,
+        exact: bool,
+        cam: CommonAttentionMetadata,
+        req_id_per_token: torch.Tensor,
+        row_offset: int = 0,
+    ) -> None:
+        if exact:
+            state.plan(num_rows, kv_lens, None, None)
+        else:
+            state.plan(num_rows, kv_lens, cam, req_id_per_token, row_offset)
+
     def build(
         self,
         common_prefix_len: int,
@@ -534,20 +745,43 @@ class FlashInferMLASparseSM90Builder(FlashInferMLASparseMetadataBuilder):
         # Plan outside any CUDA graph capture; captured runs read the
         # refreshed buffers.
         num_rows, kv_lens, exact = self._kv_lens_host(common_attn_metadata)
-        # MHA prefills are removed from q before forward_mqa. Plan only the
-        # decode prefix in that case, using the same routing decision as MLA.
-        if metadata.num_prefills > 0 and self._attention_layer._use_sparse_mha(
-            metadata
-        ):
-            num_rows = metadata.num_decode_tokens
-            kv_lens = kv_lens[:num_rows]
-        if exact:
-            self.state.plan(num_rows, kv_lens, None, None)
-        else:
-            self.state.plan(
-                num_rows, kv_lens, common_attn_metadata, metadata.req_id_per_token
-            )
+        prefill_ws = None
+        if metadata.num_prefills > 0:
+            if self._attention_layer._use_sparse_mha(metadata):
+                # MHA prefills are removed from q before forward_mqa. Plan
+                # only the decode prefix, using the same routing decision as
+                # MLA.
+                num_rows = metadata.num_decode_tokens
+                kv_lens = kv_lens[:num_rows]
+            else:
+                prefill_ws = self._build_prefill_ws(common_attn_metadata, metadata)
+        num_decode_rows = (
+            prefill_ws.num_decode_tokens if prefill_ws is not None else num_rows
+        )
+        self._plan_state(
+            self.state,
+            num_decode_rows,
+            kv_lens[:num_decode_rows],
+            exact,
+            common_attn_metadata,
+            metadata.req_id_per_token,
+        )
         metadata.state = self.state
+        metadata.prefill_ws = prefill_ws
+        metadata.prefill_state = None
+        if prefill_ws is not None:
+            # Prefill rows [num_decode_rows, num_rows) on the BF16 plan.
+            assert self.prefill_state is not None
+            self._plan_state(
+                self.prefill_state,
+                num_rows - num_decode_rows,
+                kv_lens[num_decode_rows:num_rows],
+                exact,
+                common_attn_metadata,
+                metadata.req_id_per_token,
+                row_offset=num_decode_rows,
+            )
+            metadata.prefill_state = self.prefill_state
         return metadata
 
 
@@ -591,6 +825,36 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
         assert self.topk_indices_buffer is not None
         self.supports_quant_query_input = False
         self.use_fp8_kv_cache = self.kv_cache_dtype in _FP8_KV_DTYPES
+        self.prefill_ws_tokens = 0
+        if envs.VLLM_FP8_KV_PREFILL_BF16_WORKSPACE and self.use_fp8_kv_cache:
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+            self.prefill_ws_tokens = prefill_workspace_tokens(
+                True,
+                True,
+                vllm_config.model_config.max_model_len,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                envs.VLLM_FP8_KV_PREFILL_BF16_WORKSPACE_TOKENS,
+            )
+            # Reserve at model init so the memory profiler (and thus KV pool
+            # sizing) sees it; the shared workspace keeps the largest
+            # reservation, so this only adds what exceeds other users.
+            self._prefill_workspace()
+            logger.info_once(
+                "FLASHINFER_MLA_SPARSE_SM90: FP8 KV prefill rows use a BF16 "
+                "workspace of %d tokens (%.1f MiB).",
+                self.prefill_ws_tokens,
+                self.prefill_ws_tokens * self.head_size * 2 / 2**20,
+            )
+
+    def _prefill_workspace(self) -> torch.Tensor:
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        (workspace,) = current_workspace_manager().get_simultaneous(
+            ((self.prefill_ws_tokens, self.head_size), torch.bfloat16)
+        )
+        return workspace
 
     def forward_mqa(
         self,
@@ -611,6 +875,21 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_tokens]
+        prefill_ws: PrefillWorkspaceMetadata | None = getattr(
+            attn_metadata, "prefill_ws", None
+        )
+        ws_kwargs: dict[str, Any] = {}
+        if prefill_ws is not None:
+            assert prefill_ws.request_ids.shape[0] == num_tokens, (
+                "prefill workspace planned for a different row count"
+            )
+            # Prefill rows map to workspace positions (cu_seq_lens[i] + p),
+            # decode rows (request id -1) to cache slots as usual.
+            ws_kwargs = dict(
+                HAS_PREFILL_WORKSPACE=True,
+                prefill_workspace_request_ids=prefill_ws.request_ids,
+                prefill_workspace_starts=prefill_ws.workspace_starts,
+            )
         # return_valid_counts=True keeps the compacted-prefix layout: valid
         # entries at [0, valid_count), -1 past it — exactly the prefix the
         # planned per-row lengths address.
@@ -621,11 +900,10 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
             BLOCK_SIZE=attn_metadata.block_size,
             NUM_TOPK_TOKENS=topk_indices.shape[1],
             return_valid_counts=True,
+            **ws_kwargs,
         )
         state = attn_metadata.state
         assert state is not None
-        # Pack valid prefixes at the offsets refreshed by plan() before replay.
-        state.pack_indices(topk_slots)
 
         flat = (
             kv_c_and_k_pe_cache.view(torch.float8_e4m3fn)
@@ -640,5 +918,50 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
             if self.use_fp8_kv_cache
             else {}
         )
-        out = state.wrapper.run(q_nope, q_pe, ckv, kpe, **scale_kwargs)
+        if prefill_ws is None:
+            # Pack valid prefixes at the offsets refreshed by plan() before
+            # replay.
+            state.pack_indices(topk_slots)
+            out = state.wrapper.run(q_nope, q_pe, ckv, kpe, **scale_kwargs)
+            return out, None
+
+        # Decode rows on the FP8 plan, then prefill rows on the BF16 plan.
+        # The two plans share kv_indices and the float workspace, so each
+        # pack directly precedes its run on the same stream.
+        prefill_state = attn_metadata.prefill_state
+        assert prefill_state is not None
+        num_decode_tokens = prefill_ws.num_decode_tokens
+        out = q_nope.new_empty((num_tokens, self.num_heads, self.kv_lora_rank))
+        if num_decode_tokens > 0:
+            state.pack_indices(topk_slots[:num_decode_tokens])
+            state.wrapper.run(
+                q_nope[:num_decode_tokens],
+                q_pe[:num_decode_tokens],
+                ckv,
+                kpe,
+                out=out[:num_decode_tokens],
+                **scale_kwargs,
+            )
+        workspace = self._prefill_workspace()[: prefill_ws.num_tokens]
+        # E4M3 -> BF16 is exact; the per-tensor scale multiplies in fp32
+        # before the BF16 rounding (exact for k_scale == 1).
+        ops.gather_and_maybe_dequant_cache(
+            src_cache=kv_c_and_k_pe_cache,
+            dst=workspace,
+            block_table=prefill_ws.block_table,
+            cu_seq_lens=prefill_ws.cu_seq_lens,
+            token_to_seq=prefill_ws.request_ids,  # unused by the kernel
+            num_tokens=prefill_ws.num_tokens,
+            kv_cache_dtype=self.kv_cache_dtype,
+            scale=layer._k_scale,
+        )
+        ws_flat = workspace.view(-1, 1, self.head_size)
+        prefill_state.pack_indices(topk_slots[num_decode_tokens:])
+        prefill_state.wrapper.run(
+            q_nope[num_decode_tokens:],
+            q_pe[num_decode_tokens:],
+            ws_flat[..., : self.kv_lora_rank],
+            ws_flat[..., self.kv_lora_rank :],
+            out=out[num_decode_tokens:],
+        )
         return out, None
