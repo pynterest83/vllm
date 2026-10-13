@@ -62,6 +62,21 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
 _FP8_KV_DTYPES = ("fp8", "fp8_e4m3")
+
+
+def _planned_kv_data_type(
+    use_fp8_kv_cache: bool, spec_dtype: torch.dtype
+) -> torch.dtype:
+    """KV dtype the FlashInfer plan must declare.
+
+    The KV cache spec stores FP8 caches as ``torch.uint8`` (raw storage), but
+    FlashInfer's FA2/FA3 MLA planner only accepts fp16/bf16/float8_e4m3fn and
+    ``run()`` checks the cache tensor against the planned dtype. ``forward_mqa``
+    views an FP8 cache as ``float8_e4m3fn``, so the plan must declare the same.
+    """
+    return torch.float8_e4m3fn if use_fp8_kv_cache else spec_dtype
+
+
 _WORKSPACE_BYTES = 128 * 1024 * 1024
 # TODO: FlashInfer bakes per-row kv_len into the plan on the host, which
 # forces a D2H sync under async scheduling. The plan-info layout constants
@@ -446,7 +461,7 @@ class FlashInferMLASparseSM90Builder(FlashInferMLASparseMetadataBuilder):
         self.state = _SM90State(
             device,
             impl.num_heads,
-            kv_cache_spec.dtype,
+            _planned_kv_data_type(impl.use_fp8_kv_cache, kv_cache_spec.dtype),
             vllm_config.scheduler_config.max_num_batched_tokens,
             topk_indices_buffer.shape[1],
             kv_lora_rank=impl.kv_lora_rank,

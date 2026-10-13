@@ -396,6 +396,59 @@ def test_builder_kpool_from_model_config(monkeypatch, index_kpool, prefill_lens)
     assert lens.tolist() == prefill_lens + [99, 100]
 
 
+@pytest.mark.parametrize(
+    "cache_dtype,spec_dtype,planned",
+    [
+        ("auto", torch.bfloat16, torch.bfloat16),
+        ("bfloat16", torch.bfloat16, torch.bfloat16),
+        # The spec stores FP8 as raw uint8, which FlashInfer's planner rejects.
+        ("fp8", torch.uint8, torch.float8_e4m3fn),
+        ("fp8_e4m3", torch.uint8, torch.float8_e4m3fn),
+    ],
+)
+def test_builder_plans_fp8_cache_as_e4m3(monkeypatch, cache_dtype, spec_dtype, planned):
+    """The plan's kv_data_type must match the dtype forward_mqa views the
+    cache as, not the spec's raw uint8 storage dtype."""
+    monkeypatch.setattr(
+        sm90_mod.FlashInferMLASparseMetadataBuilder,
+        "__init__",
+        lambda *_args, **_kwargs: None,
+    )
+
+    class _RecordingState:
+        def __init__(self, _device, _num_heads, kv_dtype, *_args, **_kwargs):
+            self.kv_dtype = kv_dtype
+
+    monkeypatch.setattr(sm90_mod, "_SM90State", _RecordingState)
+    impl, _ = make_impl(0, cache_dtype)
+    spec = MLAAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=HEAD,
+        dtype=spec_dtype,
+        cache_dtype_str=cache_dtype,
+    )
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={"attn": SimpleNamespace(impl=impl)}
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=64, async_scheduling=False
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=2048, index_kpool=4)
+        ),
+        speculative_config=None,
+    )
+    builder = FlashInferMLASparseSM90Builder(
+        spec, ["attn"], vllm_config, torch.device("cpu")
+    )
+    assert builder.state.kv_dtype == planned
+    # 512 B/token for the NoPE e4m3 latent; the BF16 latent is twice that.
+    bytes_per_elem = 2 if planned == torch.bfloat16 else 1
+    assert spec.page_size_bytes == BLOCK_SIZE * HEAD * bytes_per_elem
+
+
 def _sm90_flashinfer_available():
     return (
         torch.cuda.is_available()
