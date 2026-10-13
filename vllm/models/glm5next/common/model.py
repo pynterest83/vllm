@@ -978,8 +978,12 @@ class Glm5NextForCausalLM(
         cls,
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, torch.dtype]:
+        # Must match Glm5NextLinearAttention.get_state_dtype: the hybrid
+        # block size is derived from this page size.
         return MambaStateDtypeCalculator.kda_state_dtype(
-            vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
 
     @classmethod

@@ -146,6 +146,50 @@ def test_fused_recurrent_kda_matches_reference(num_seqs: int, query_len: int):
     ("num_seqs", "query_len"), [(7, 1), (3, 3)], ids=["7x1", "3x3"]
 )
 @torch.inference_mode()
+def test_fused_recurrent_kda_bf16_state_matches_reference(
+    num_seqs: int, query_len: int
+):
+    """--mamba-ssm-cache-dtype bfloat16: the kernel loads the bf16 state,
+    accumulates in fp32 and rounds the written state to bf16."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    inputs, state32 = make_inputs(num_seqs, query_len, device)
+    state = state32.to(torch.bfloat16)
+    expected_state = state.float()
+    out = run_kernel(inputs, state)
+    assert state.dtype == torch.bfloat16
+
+    indices = inputs["ssm_state_indices"].view(num_seqs, query_len)
+    accepted = inputs.get("num_accepted_tokens")
+    expected = torch.empty_like(out[0], dtype=torch.float32)
+    for n in range(num_seqs):
+        first = indices[n, 0 if accepted is None else accepted[n] - 1]
+        s = expected_state[first]
+        for t in range(query_len):
+            tok = slice(n * query_len + t, n * query_len + t + 1)
+            expected[tok], s = naive_recurrent_kda(
+                inputs["q"][0, tok],
+                inputs["k"][0, tok],
+                inputs["v"][0, tok],
+                inputs["g"][0, tok],
+                inputs["beta"][0, tok],
+                inputs["a_log"],
+                inputs["g_bias"].view(H, D),
+                s,
+            )
+            expected_state[indices[n, t]] = s
+
+    torch.testing.assert_close(out[0].float(), expected, rtol=2e-2, atol=1e-2)
+    used = indices.flatten().long()
+    torch.testing.assert_close(
+        state[used].float(), expected_state[used], rtol=2e-2, atol=2e-2
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_seqs", "query_len"), [(7, 1), (3, 3)], ids=["7x1", "3x3"]
+)
+@torch.inference_mode()
 def test_fused_recurrent_kda_strided_inputs_bit_identical_to_contiguous(
     num_seqs: int, query_len: int
 ):
