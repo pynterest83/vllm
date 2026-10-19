@@ -378,6 +378,9 @@ class _SM90State:
         states whose runs are serialized on one stream can share them."""
         from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
+        from vllm.utils.flashinfer_overlay import log_active_overlay
+
+        log_active_overlay()
         self.workspace = (
             float_workspace
             if float_workspace is not None

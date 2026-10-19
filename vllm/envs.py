@@ -300,6 +300,8 @@ if TYPE_CHECKING:
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_FP8_KV_PREFILL_BF16_WORKSPACE: bool = False
     VLLM_FP8_KV_PREFILL_BF16_WORKSPACE_TOKENS: int = 0
+    VLLM_FLASHINFER_INCLUDE_OVERLAY: str = ""
+    VLLM_FLASHINFER_OVERLAY_WORKSPACE: str = ""
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
@@ -2065,6 +2067,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FP8_KV_PREFILL_BF16_WORKSPACE_TOKENS": lambda: int(
         os.getenv("VLLM_FP8_KV_PREFILL_BF16_WORKSPACE_TOKENS", "0")
     ),
+    # FlashInfer include root (a directory containing flashinfer/) that the
+    # FlashInfer JIT compiles from instead of the installed package's headers;
+    # empty = the installed headers. Applied on `import vllm` (env_override),
+    # see vllm/utils/flashinfer_overlay.py.
+    "VLLM_FLASHINFER_INCLUDE_OVERLAY": lambda: os.getenv(
+        "VLLM_FLASHINFER_INCLUDE_OVERLAY", ""
+    ),
+    # JIT workspace (FLASHINFER_WORKSPACE_BASE) for the overlay's modules;
+    # empty = $VLLM_CACHE_ROOT/flashinfer_overlay/<hash of the overlay path>.
+    "VLLM_FLASHINFER_OVERLAY_WORKSPACE": lambda: os.getenv(
+        "VLLM_FLASHINFER_OVERLAY_WORKSPACE", ""
+    ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
@@ -2323,6 +2337,10 @@ def compile_factors() -> dict[str, object]:
         # the compiled graph treats attention as an opaque splitting op.
         "VLLM_FP8_KV_PREFILL_BF16_WORKSPACE",
         "VLLM_FP8_KV_PREFILL_BF16_WORKSPACE_TOKENS",
+        # Which headers FlashInfer's JIT compiles kernels from; FlashInfer
+        # kernels run inside opaque custom ops, not in compiled graphs.
+        "VLLM_FLASHINFER_INCLUDE_OVERLAY",
+        "VLLM_FLASHINFER_OVERLAY_WORKSPACE",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache

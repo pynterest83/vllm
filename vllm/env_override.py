@@ -982,3 +982,13 @@ if os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower() in (
     )
 
     _install_force_first_config()
+
+# ============================================================
+# Opt-in FlashInfer header overlay
+# ============================================================
+# Must run before anything imports flashinfer; a no-op unless
+# VLLM_FLASHINFER_INCLUDE_OVERLAY is set (vllm/utils/flashinfer_overlay.py).
+if os.environ.get("VLLM_FLASHINFER_INCLUDE_OVERLAY"):
+    from vllm.utils.flashinfer_overlay import maybe_apply_flashinfer_include_overlay
+
+    maybe_apply_flashinfer_include_overlay()
